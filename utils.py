@@ -1,29 +1,59 @@
 import logging
 import sys
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+from colorama import init as colorama_init, Fore, Style
 from config import Config
 
+
+class _ColorFormatter(logging.Formatter):
+    """Adds ANSI color codes to log levels for console output."""
+
+    COLOR_MAP = {
+        logging.DEBUG: Fore.CYAN,
+        logging.INFO: Fore.GREEN,
+        logging.WARNING: Fore.YELLOW,
+        logging.ERROR: Fore.RED,
+        logging.CRITICAL: Fore.MAGENTA + Style.BRIGHT,
+    }
+
+    def format(self, record):
+        message = super().format(record)
+        color = self.COLOR_MAP.get(record.levelno, "")
+        if not color:
+            return message
+        return f"{color}{message}{Style.RESET_ALL}"
+
+
 def setup_logging():
-    """Configures the logging system."""
+    """Configures the logging system without duplicating handlers."""
+    colorama_init(autoreset=True)
     Config.ensure_dirs()
-    
+    logger = logging.getLogger("TS2MP4")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
     log_filename = Config.LOG_DIR / f"conversion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_filename, encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    return logging.getLogger("TS2MP4")
+    base_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    file_handler = logging.FileHandler(log_filename, encoding="utf-8")
+    file_handler.setFormatter(base_formatter)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(_ColorFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
+
 
 def get_input_files():
-    """Scans the input directory for .ts files."""
-    if not Config.INPUT_DIR.exists():
-        return []
+    """Scans the input directory for configured input files."""
+    Config.ensure_dirs()
     return list(Config.INPUT_DIR.glob(f"*{Config.INPUT_EXT}"))
 
 def format_size(size_bytes):
