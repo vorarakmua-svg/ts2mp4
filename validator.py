@@ -22,8 +22,12 @@ class VideoValidator:
         ]
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Add 30-second timeout to prevent hanging on corrupted files
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
             return json.loads(result.stdout)
+        except subprocess.TimeoutExpired:
+            logger.error(f"Timeout while probing file {file_path} (exceeded 30s)")
+            return None
         except subprocess.CalledProcessError as e:
             stderr = (e.stderr or "").strip()
             logger.error(f"Failed to probe file {file_path}: {stderr or e}")

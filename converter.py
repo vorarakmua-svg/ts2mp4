@@ -2,6 +2,7 @@ import subprocess
 import time
 import logging
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -26,6 +27,13 @@ class ConversionResult:
 
 
 class VideoConverter:
+    # Compile regex patterns once at class level for performance
+    _DURATION_PATTERN = re.compile(r"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})")
+    _TIME_PATTERN = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})")
+    _FPS_PATTERN = re.compile(r"fps=\s*(\d+\.?\d*)")
+    _BITRATE_PATTERN = re.compile(r"bitrate=\s*([\d.]+\s*\w+bits/s)")
+    _SPEED_PATTERN = re.compile(r"speed=\s*([\d.]+)x")
+
     def __init__(self):
         # Ensure required directories exist before any work begins
         Config.ensure_dirs()
@@ -43,7 +51,11 @@ class VideoConverter:
 
         cmd = [Config.FFMPEG_BIN, "-hide_banner", "-encoders"]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Add 10-second timeout for encoder detection
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("FFmpeg encoder detection timed out. Falling back to CPU.")
+            return "cpu"
         except FileNotFoundError:
             logger.critical("FFmpeg not found! Please ensure ffmpeg is in your PATH.")
             raise
@@ -63,15 +75,86 @@ class VideoConverter:
         logger.warning("FFmpeg build does not list NVENC encoders. Falling back to CPU.")
         return "cpu"
 
+    @staticmethod
+    def _validate_path_safety(path: Path) -> None:
+        """Validates path for security concerns (command injection, dangerous characters)."""
+        path_str = str(path)
+        # Check for potentially dangerous characters that could be used for injection
+        dangerous_chars = [';', '&', '|', '`', '$', '>', '<', '\n', '\r']
+        if any(char in path_str for char in dangerous_chars):
+            raise ValueError(f"Path contains potentially dangerous characters: {path}")
+
+        # Ensure path is absolute to prevent relative path issues
+        if not path.is_absolute():
+            raise ValueError(f"Path must be absolute: {path}")
+
+        # No symlinks allowed to prevent symlink attacks
+        if path.is_symlink():
+            raise ValueError(f"Symlinks not allowed: {path}")
+
+    @staticmethod
+    def _validate_path_within_directory(path: Path, allowed_dir: Path) -> None:
+        """Prevents path traversal attacks by ensuring path is within allowed directory."""
+        try:
+            resolved_path = path.resolve(strict=False)
+            resolved_dir = allowed_dir.resolve(strict=False)
+
+            # Check if path is within allowed directory
+            resolved_path.relative_to(resolved_dir)
+        except ValueError:
+            raise ValueError(f"Path outside allowed directory: {path}")
+
+    @staticmethod
+    def _validate_file_size(path: Path, max_size: int = 50 * 1024 ** 3) -> None:
+        """Validates file size is within acceptable range (default: 50GB max)."""
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+
+        size = path.stat().st_size
+        if size == 0:
+            raise ValueError(f"File is empty: {path}")
+        if size > max_size:
+            raise ValueError(
+                f"File too large: {size / (1024**3):.2f}GB "
+                f"(max: {max_size / (1024**3):.2f}GB)"
+            )
+
+    @staticmethod
+    def _check_disk_space(input_path: Path, output_dir: Path) -> None:
+        """Ensures sufficient disk space for conversion."""
+        input_size = input_path.stat().st_size
+        # Conservative estimate: output might be up to 1.5x input size
+        estimated_output = int(input_size * 1.5)
+        safety_margin = 2 * 1024 ** 3  # 2GB safety margin
+        required_space = estimated_output + safety_margin
+
+        stat = shutil.disk_usage(output_dir)
+        if stat.free < required_space:
+            raise OSError(
+                f"Insufficient disk space. Required: {required_space / (1024**3):.2f}GB, "
+                f"Available: {stat.free / (1024**3):.2f}GB"
+            )
+
     def convert_file(
         self,
         input_path: Path,
         progress_callback=None,
+        stats_callback=None,
         cancel_event: Optional[Event] = None,
     ) -> ConversionResult:
         """
         Converts a single file and returns a detailed result.
         """
+        # SECURITY VALIDATION BLOCK
+        try:
+            self._validate_path_safety(input_path)
+            self._validate_path_within_directory(input_path, Config.INPUT_DIR)
+            self._validate_file_size(input_path)
+            self._check_disk_space(input_path, Config.OUTPUT_DIR)
+        except (ValueError, FileNotFoundError, OSError) as e:
+            logger.error(f"Security validation failed for {input_path}: {e}")
+            return ConversionResult(False, error=str(e))
+
         if not input_path.exists():
             message = f"Input file does not exist: {input_path}"
             logger.error(message)
@@ -126,6 +209,7 @@ class VideoConverter:
             success, cancelled, last_progress, last_line = self._run_ffmpeg(
                 cmd,
                 progress_callback=progress_callback,
+                stats_callback=stats_callback,
                 cancel_event=cancel_event,
                 duration_hint=source_duration,
             )
@@ -165,15 +249,21 @@ class VideoConverter:
                 hardware_failed = True
                 continue
 
+            # Atomic file replacement to avoid race conditions
             try:
-                if output_path.exists():
-                    output_path.unlink()
+                # replace() is atomic on most systems - it handles existing files
                 temp_output_path.replace(output_path)
             except OSError as finalize_err:
-                last_error = f"Failed to finalize output file: {finalize_err}"
-                logger.error(last_error)
-                self._safe_unlink(temp_output_path)
-                return ConversionResult(False, source_duration=source_duration, error=last_error)
+                # If replace failed, try unlinking first and retry once
+                try:
+                    if output_path.exists():
+                        output_path.unlink()
+                    temp_output_path.replace(output_path)
+                except OSError as retry_err:
+                    last_error = f"Failed to finalize output file: {retry_err}"
+                    logger.error(last_error)
+                    self._safe_unlink(temp_output_path)
+                    return ConversionResult(False, source_duration=source_duration, error=last_error)
 
             try:
                 input_path.unlink()
@@ -236,10 +326,14 @@ class VideoConverter:
         cmd: List[str],
         *,
         progress_callback,
+        stats_callback=None,
         cancel_event: Optional[Event],
         duration_hint: Optional[float],
     ) -> Tuple[bool, bool, float, Optional[str]]:
-        """Executes FFmpeg while streaming progress updates."""
+        """Executes FFmpeg while streaming progress updates and statistics."""
+        # Calculate timeout: allow 10x realtime for safety, default 1 hour
+        timeout = (duration_hint * 10) if duration_hint else 3600
+
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -250,11 +344,18 @@ class VideoConverter:
 
         duration = duration_hint
         last_progress = 0.0
+        percent = 0.0  # Initialize to avoid UnboundLocalError
         last_line = None
+        start_time = time.time()
 
         try:
             if not process.stderr:
-                process.wait()
+                try:
+                    process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    logger.error("FFmpeg process timed out")
+                    process.kill()
+                    return False, False, last_progress, "Process timed out"
                 return process.returncode == 0, False, last_progress, last_line
 
             for line in process.stderr:
@@ -265,14 +366,14 @@ class VideoConverter:
                     process.terminate()
                     break
 
-                if duration is None and "Duration" in line:
-                    match = re.search(r"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})", line)
+                if duration is None and "Duration:" in line:
+                    match = self._DURATION_PATTERN.search(line)
                     if match:
                         h, m, s = map(float, match.groups())
                         duration = h * 3600 + m * 60 + s
 
                 if duration and "time=" in line:
-                    match = re.search(r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})", line)
+                    match = self._TIME_PATTERN.search(line)
                     if match:
                         h, m, s = map(float, match.groups())
                         current_time = h * 3600 + m * 60 + s
@@ -283,7 +384,47 @@ class VideoConverter:
                                 progress_callback(delta)
                                 last_progress = percent
 
-            process.wait()
+                    # Extract and report detailed statistics
+                    if stats_callback:
+                        stats = {}
+
+                        # FPS
+                        fps_match = self._FPS_PATTERN.search(line)
+                        if fps_match:
+                            stats['fps'] = fps_match.group(1)
+
+                        # Bitrate
+                        bitrate_match = self._BITRATE_PATTERN.search(line)
+                        if bitrate_match:
+                            stats['bitrate'] = bitrate_match.group(1)
+
+                        # Speed
+                        speed_match = self._SPEED_PATTERN.search(line)
+                        if speed_match:
+                            stats['speed'] = f"{speed_match.group(1)}x"
+
+                        # Progress percentage
+                        stats['progress'] = percent
+
+                        if stats:
+                            stats_callback(stats)
+
+                # Check for timeout during processing
+                elapsed = time.time() - start_time
+                if elapsed > timeout:
+                    logger.error("FFmpeg process exceeded timeout")
+                    process.terminate()
+                    last_line = "Process timed out"
+                    break
+
+            # Wait for process to complete with remaining timeout
+            remaining_timeout = max(1, timeout - (time.time() - start_time))
+            try:
+                process.wait(timeout=remaining_timeout)
+            except subprocess.TimeoutExpired:
+                logger.error("FFmpeg process timed out during wait")
+                process.kill()
+                last_line = "Process timed out"
         finally:
             if process.stderr:
                 process.stderr.close()

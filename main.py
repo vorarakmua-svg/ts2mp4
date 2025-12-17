@@ -1,14 +1,23 @@
+"""
+TS2MP4 Professional Video Converter - Main Entry Point
+Features professional-grade visual display and concurrent processing
+"""
 import argparse
 import sys
 import time
 import signal
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock, Semaphore, Thread
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Tuple
 from colorama import Fore, Style
-from tqdm import tqdm
 from config import Config
 from utils import setup_logging, get_input_files
-from converter import VideoConverter
+from converter import VideoConverter, ConversionResult
+from display import get_display
+from metrics import MetricsCollector
+from health import HealthMonitor
+from profiler import PerformanceProfiler
 
 STOP_EVENT = Event()
 
@@ -29,20 +38,131 @@ def register_signal_handlers():
             pass
 
 
+def display_update_loop(display, stop_event: Event):
+    """Background thread to update display periodically"""
+    while not stop_event.is_set():
+        try:
+            display.display()
+            time.sleep(0.5)  # Update every 500ms
+        except Exception:
+            # Silently continue on display errors
+            pass
+
+
+def health_check_loop(health_monitor, stop_event: Event):
+    """Background thread to perform periodic health checks"""
+    while not stop_event.is_set():
+        try:
+            health_monitor.check_health()
+            time.sleep(5)  # Check every 5 seconds
+        except Exception as e:
+            # Silently continue on health check errors
+            pass
+
+
+def process_file_worker(
+    converter: VideoConverter,
+    input_file: Path,
+    cancel_event: Event,
+    gpu_semaphore: Semaphore,
+    display,
+    completed_count: dict,
+    failed_count: dict,
+    count_lock: Lock,
+    metrics_collector=None,
+) -> Tuple[Path, ConversionResult]:
+    """Worker function with enhanced display integration and metrics collection"""
+
+    # Update display with current file
+    display.update_stats(
+        current_file=input_file.name,
+        encoder=converter.hw_accel.upper() if converter.hw_accel == "cuda" else "CPU",
+        current_progress=0.0,
+    )
+
+    def stats_callback(stats: dict):
+        """Callback to update display with FFmpeg statistics"""
+        display.update_stats(
+            current_progress=stats.get('progress', 0.0),
+            current_speed=stats.get('speed', '0.00x'),
+            fps=stats.get('fps', '0'),
+            bitrate=stats.get('bitrate', '0 kbits/s'),
+        )
+
+    # Perform conversion
+    if converter.hw_accel == "cuda":
+        with gpu_semaphore:
+            result = converter.convert_file(
+                input_file,
+                progress_callback=None,
+                stats_callback=stats_callback,
+                cancel_event=cancel_event,
+            )
+    else:
+        result = converter.convert_file(
+            input_file,
+            progress_callback=None,
+            stats_callback=stats_callback,
+            cancel_event=cancel_event,
+        )
+
+    # Record metrics
+    if metrics_collector:
+        metrics_collector.record_conversion(
+            input_path=input_file,
+            output_path=result.output_path,
+            success=result.success,
+            duration=result.elapsed_seconds,
+            encoder=result.encoder or "unknown",
+            realtime_factor=result.realtime_factor,
+            error=result.error,
+            retried_with_cpu=result.retried_with_cpu,
+            cancelled=result.cancelled,
+        )
+
+    # Update counts
+    with count_lock:
+        if result.success:
+            completed_count['value'] += 1
+        else:
+            failed_count['value'] += 1
+
+        display.update_stats(
+            completed=completed_count['value'],
+            failed=failed_count['value'],
+        )
+
+    return input_file, result
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Batch convert .ts files to .mp4.")
+    parser = argparse.ArgumentParser(
+        description="TS2MP4 Professional Video Converter - Batch convert .ts files to .mp4 with real-time monitoring.",
+        epilog="Experience professional-grade conversion with live statistics and resource monitoring."
+    )
     parser.add_argument("--input-dir", type=Path, help="Directory containing input .ts files.")
     parser.add_argument("--output-dir", type=Path, help="Directory where converted files are written.")
     parser.add_argument("--log-dir", type=Path, help="Directory where logs are stored.")
     parser.add_argument("--ffmpeg-bin", type=str, help="Path to ffmpeg executable.")
     parser.add_argument("--ffprobe-bin", type=str, help="Path to ffprobe executable.")
-    parser.add_argument("--sleep-between", type=float, help="Seconds to sleep between conversions.")
+    parser.add_argument("--sleep-between", type=float, help="Seconds to sleep between conversions (deprecated in concurrent mode).")
+    parser.add_argument("--profile", action="store_true", help="Enable performance profiling.")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate conversion without actually converting files.")
+    parser.add_argument("--wizard", action="store_true", help="Run interactive configuration wizard.")
     return parser.parse_args()
 
 
 def main():
     register_signal_handlers()
     args = parse_args()
+
+    # Handle wizard mode
+    if args.wizard:
+        from wizard import ConfigurationWizard
+        wizard = ConfigurationWizard()
+        wizard.run()
+        sys.exit(0)
+
     Config.apply_overrides(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
@@ -55,6 +175,19 @@ def main():
     logger = setup_logging()
     logger.info("TS2MP4 Converter Started")
 
+    # Check for dry-run mode
+    if args.dry_run:
+        print(f"\n{Fore.YELLOW}{Style.BRIGHT}🔍 DRY-RUN MODE ENABLED{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}No files will be converted. Showing what would happen...{Style.RESET_ALL}\n")
+        logger.info("DRY-RUN mode enabled")
+
+    # Initialize profiler if enabled
+    profiler = None
+    if args.profile:
+        profiler = PerformanceProfiler(Config.LOG_DIR)
+        profiler.start()
+        logger.info("Performance profiling enabled")
+
     files = get_input_files()
     if not files:
         message = f"No {Config.INPUT_EXT} files found in {Config.INPUT_DIR}"
@@ -65,65 +198,202 @@ def main():
     print(f"{Fore.CYAN}Found {len(files)} files to convert.{Style.RESET_ALL}")
     logger.info(f"Found {len(files)} files.")
 
+    # Handle dry-run mode
+    if args.dry_run:
+        print(f"\n{Fore.CYAN}{Style.BRIGHT}╔{'═' * 78}╗{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.YELLOW}{Style.BRIGHT}DRY-RUN SIMULATION{Style.RESET_ALL}" + " " * 61 + f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{Style.BRIGHT}╠{'═' * 78}╣{Style.RESET_ALL}")
+
+        for idx, input_file in enumerate(files, 1):
+            output_filename = input_file.stem + Config.OUTPUT_EXT
+            output_path = Config.OUTPUT_DIR / output_filename
+            file_size_mb = input_file.stat().st_size / (1024 ** 2)
+
+            print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.GREEN}[{idx}/{len(files)}]{Style.RESET_ALL} {input_file.name}")
+            print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}     → Size: {file_size_mb:.2f} MB")
+            print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}     → Output: {output_path}")
+            print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}     → Action: Would convert using {'GPU (NVENC)' if Config.ENABLE_GPU else 'CPU (libx264)'}")
+
+        print(f"{Fore.CYAN}{Style.BRIGHT}╚{'═' * 78}╝{Style.RESET_ALL}")
+        print(f"\n{Fore.YELLOW}Dry-run complete. No files were modified.{Style.RESET_ALL}")
+        logger.info("Dry-run simulation completed")
+        sys.exit(0)
+
     try:
         converter = VideoConverter()
     except Exception as e:
         logger.critical(f"Failed to initialize converter: {e}")
         sys.exit(1)
 
+    # Initialize metrics collector
+    metrics_collector = MetricsCollector(Config.LOG_DIR)
+    logger.info("Metrics collection enabled")
+
+    # Initialize health monitor
+    health_monitor = HealthMonitor(Config.LOG_DIR / "health_status.json")
+    health_monitor.check_health()  # Initial health check
+    logger.info("Health monitoring enabled")
+
+    # Initialize enhanced display
+    display = get_display()
+    display.update_stats(
+        total_files=len(files),
+        completed=0,
+        failed=0,
+        encoder=converter.hw_accel.upper() if converter.hw_accel == "cuda" else "CPU",
+    )
+
+    # Determine concurrency based on hardware
+    max_workers = Config.MAX_CONCURRENT_CONVERSIONS
+    if converter.hw_accel == "cuda":
+        # Limit GPU concurrency to avoid memory issues
+        max_workers = min(max_workers, 2)
+        logger.info(f"GPU detected: limiting concurrency to {max_workers} workers")
+    else:
+        logger.info(f"Using CPU encoding with {max_workers} workers")
+
+    # GPU semaphore to control GPU resource usage
+    gpu_semaphore = Semaphore(1 if converter.hw_accel == "cuda" else max_workers)
+
+    # Thread-safe counters
+    count_lock = Lock()
+    completed_count = {'value': 0}
+    failed_count = {'value': 0}
+
     exit_code = 0
+    completed_files = []
+    failed_files = []
 
-    with tqdm(total=len(files), desc="Total Progress", unit="file") as pbar_total:
-        for index, input_file in enumerate(files):
-            if STOP_EVENT.is_set():
-                break
+    # Start display update thread
+    display_stop = Event()
+    display_thread = Thread(target=display_update_loop, args=(display, display_stop), daemon=True)
+    display_thread.start()
 
-            with tqdm(total=100, desc=f"Converting {input_file.name}", unit="%", leave=False) as pbar_file:
+    # Start health check thread
+    health_stop = Event()
+    health_thread = Thread(target=health_check_loop, args=(health_monitor, health_stop), daemon=True)
+    health_thread.start()
 
-                def update_progress(delta):
-                    pbar_file.update(delta)
-                    pbar_file.refresh()
+    logger.info("Starting conversion with %d workers...", max_workers)
 
-                result = converter.convert_file(
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(
+                    process_file_worker,
+                    converter,
                     input_file,
-                    progress_callback=update_progress,
-                    cancel_event=STOP_EVENT,
-                )
+                    STOP_EVENT,
+                    gpu_semaphore,
+                    display,
+                    completed_count,
+                    failed_count,
+                    count_lock,
+                    metrics_collector,
+                ): input_file
+                for input_file in files
+            }
 
-            if result.success:
-                speed = f"{result.realtime_factor:.2f}x" if result.realtime_factor else "N/A"
-                logger.info(
-                    "Converted %s in %.2fs (speed: %s) using %s%s",
-                    input_file.name,
-                    result.elapsed_seconds,
-                    speed,
-                    result.encoder,
-                    " after GPU fallback" if result.retried_with_cpu else "",
-                )
-                pbar_total.write(f"{Fore.GREEN}[+] Successfully converted: {input_file.name}{Style.RESET_ALL}")
-            else:
-                exit_code = exit_code or (130 if result.cancelled else 1)
-                reason = result.error or "Unknown error"
-                if result.cancelled:
-                    pbar_total.write(f"{Fore.YELLOW}[!] Cancelled: {input_file.name} ({reason}){Style.RESET_ALL}")
+            # Process completed tasks as they finish
+            for future in as_completed(future_to_file):
+                if STOP_EVENT.is_set():
+                    # Cancel remaining futures
+                    for f in future_to_file:
+                        f.cancel()
                     break
-                pbar_total.write(f"{Fore.RED}[-] Failed to convert: {input_file.name} ({reason}){Style.RESET_ALL}")
-                logger.error("Failed to convert %s: %s", input_file.name, reason)
 
-            pbar_total.update(1)
+                input_file = future_to_file[future]
 
-            if STOP_EVENT.is_set():
-                break
+                try:
+                    input_file, result = future.result()
 
-            if index < len(files) - 1 and Config.SLEEP_BETWEEN_FILES > 0:
-                time.sleep(Config.SLEEP_BETWEEN_FILES)
+                    if result.success:
+                        speed = f"{result.realtime_factor:.2f}x" if result.realtime_factor else "N/A"
+                        logger.info(
+                            "Converted %s in %.2fs (speed: %s) using %s%s",
+                            input_file.name,
+                            result.elapsed_seconds,
+                            speed,
+                            result.encoder,
+                            " after GPU fallback" if result.retried_with_cpu else "",
+                        )
+                        completed_files.append(input_file)
+                    else:
+                        exit_code = exit_code or (130 if result.cancelled else 1)
+                        reason = result.error or "Unknown error"
+
+                        if not result.cancelled:
+                            logger.error("Failed to convert %s: %s", input_file.name, reason)
+                            failed_files.append(input_file)
+
+                except Exception as e:
+                    logger.error(f"Unexpected error processing {input_file}: {e}", exc_info=True)
+                    failed_files.append(input_file)
+                    exit_code = 1
+
+                if STOP_EVENT.is_set():
+                    break
+
+    finally:
+        # Stop display thread
+        display_stop.set()
+        display_thread.join(timeout=1)
+
+        # Stop health check thread
+        health_stop.set()
+        health_thread.join(timeout=1)
+
+        # Clear screen and show professional final summary
+        display.clear_screen()
+
+    # Print professional final summary
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}╔{'═' * 78}╗{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.GREEN}{Style.BRIGHT}CONVERSION COMPLETE{Style.RESET_ALL}" + " " * 58 + f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}╠{'═' * 78}╣{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.GREEN}✓ Completed:{Style.RESET_ALL} {len(completed_files):3d} files" + " " * 55 + f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.RED}✗ Failed:{Style.RESET_ALL}    {len(failed_files):3d} files" + " " * 55 + f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.YELLOW}⊕ Total:{Style.RESET_ALL}     {len(files):3d} files" + " " * 55 + f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}╚{'═' * 78}╝{Style.RESET_ALL}")
 
     if STOP_EVENT.is_set():
-        print(f"\n{Fore.YELLOW}Processing interrupted by user.{Style.RESET_ALL}")
+        print(f"\n{Fore.YELLOW}{Style.BRIGHT}⚠ Processing interrupted by user.{Style.RESET_ALL}")
         logger.warning("Processing interrupted by user.")
     else:
-        print(f"\n{Fore.GREEN}All tasks completed.{Style.RESET_ALL}")
+        print(f"\n{Fore.GREEN}{Style.BRIGHT}✓ All tasks completed successfully!{Style.RESET_ALL}")
         logger.info("Batch conversion finished.")
+
+    # Export metrics
+    if metrics_collector.total_conversions > 0:
+        try:
+            json_path = metrics_collector.export_to_json()
+            csv_path = metrics_collector.export_to_csv()
+            print(f"\n{Fore.CYAN}📊 Metrics exported:{Style.RESET_ALL}")
+            print(f"  • JSON: {json_path}")
+            print(f"  • CSV:  {csv_path}")
+            logger.info(f"Metrics exported to {json_path} and {csv_path}")
+        except Exception as e:
+            logger.error(f"Failed to export metrics: {e}")
+
+    # Export final health report
+    try:
+        health_report_path = health_monitor.export_health_report()
+        print(f"\n{Fore.CYAN}🏥 Health report: {health_report_path}{Style.RESET_ALL}")
+    except Exception as e:
+        logger.error(f"Failed to export health report: {e}")
+
+    # Export profiling data if enabled
+    if profiler:
+        try:
+            profiler.stop()
+            profile_txt = profiler.export_stats()
+            profile_bin = profiler.export_binary()
+            print(f"\n{Fore.CYAN}⚡ Performance profile:{Style.RESET_ALL}")
+            print(f"  • Report: {profile_txt}")
+            print(f"  • Binary: {profile_bin}")
+            logger.info(f"Performance profile exported to {profile_txt}")
+        except Exception as e:
+            logger.error(f"Failed to export performance profile: {e}")
 
     sys.exit(exit_code)
 
