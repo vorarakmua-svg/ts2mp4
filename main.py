@@ -96,21 +96,20 @@ def process_file_worker(
 ) -> Tuple[Path, ConversionResult]:
     """Worker function with enhanced display integration and metrics collection"""
 
-    # Update display with current file
-    display.update_stats(
-        current_file=input_file.name,
-        encoder=converter.hw_accel.upper() if converter.hw_accel == "cuda" else "CPU",
-        current_progress=0.0,
-    )
+    # Update display with current file (the converter reports the encoder once an attempt starts)
+    display.update_stats(current_file=input_file.name, current_progress=0.0)
+
+    stat_fields = {
+        'encoder': 'encoder',
+        'progress': 'current_progress',
+        'speed': 'current_speed',
+        'fps': 'fps',
+        'bitrate': 'bitrate',
+    }
 
     def stats_callback(stats: dict):
-        """Callback to update display with FFmpeg statistics"""
-        display.update_stats(
-            current_progress=stats.get('progress', 0.0),
-            current_speed=stats.get('speed', '0.00x'),
-            fps=stats.get('fps', '0'),
-            bitrate=stats.get('bitrate', '0 kbits/s'),
-        )
+        """Forward only the statistics FFmpeg actually reported, leaving other fields untouched"""
+        display.update_stats(**{stat_fields[key]: value for key, value in stats.items() if key in stat_fields})
 
     result = converter.convert_file(
         input_file,
@@ -146,6 +145,7 @@ def process_file_worker(
         display.update_stats(
             completed=counts['completed'] + counts['skipped'],
             failed=counts['failed'],
+            current_progress=0.0,
         )
 
     return input_file, result
@@ -278,7 +278,7 @@ def main():
         total_files=len(files),
         completed=0,
         failed=0,
-        encoder=converter.hw_accel.upper() if converter.hw_accel == "cuda" else "CPU",
+        encoder="Starting...",
     )
 
     max_workers = determine_worker_count(converter.hw_accel, Config.MAX_CONCURRENT_CONVERSIONS)

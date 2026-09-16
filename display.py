@@ -3,7 +3,9 @@ Enhanced visual display for TS2MP4 converter
 Provides real-time statistics, resource monitoring, and engaging visual feedback
 Professional-grade UI for commercial applications
 """
+import re
 import time
+import unicodedata
 import psutil
 import sys
 from dataclasses import dataclass
@@ -19,6 +21,46 @@ init(autoreset=True)
 __version__ = "2.0.0"
 __app_name__ = "TS2MP4 Professional Video Converter"
 
+BOX_WIDTH = 80                 # Total columns including the border characters
+CONTENT_WIDTH = BOX_WIDTH - 4  # "║ " + content + " ║"
+
+_ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _char_width(char: str) -> int:
+    """Terminal columns used by a character: 0 for combining marks (e.g. Thai vowels), 2 for wide (CJK)."""
+    if unicodedata.combining(char) or unicodedata.category(char) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def visible_width(text: str) -> int:
+    """Width of text as displayed in a terminal, ignoring ANSI color codes."""
+    return sum(_char_width(char) for char in _ANSI_PATTERN.sub("", text))
+
+
+def fit_to_width(text: str, width: int) -> str:
+    """Pad or truncate (with "...") colored text to exactly `width` terminal columns."""
+    text_width = visible_width(text)
+    if text_width <= width:
+        return text + " " * (width - text_width)
+
+    limit = width - 3
+    result, used, pos = [], 0, 0
+    while pos < len(text):
+        match = _ANSI_PATTERN.match(text, pos)
+        if match:
+            result.append(match.group())
+            pos = match.end()
+            continue
+        char_width = _char_width(text[pos])
+        if used + char_width > limit:
+            break
+        result.append(text[pos])
+        used += char_width
+        pos += 1
+    return "".join(result) + Style.RESET_ALL + "..." + " " * (limit - used)
+
 
 @dataclass
 class ConversionStats:
@@ -33,7 +75,6 @@ class ConversionStats:
     fps: str = "0"
     bitrate: str = "0 kbits/s"
     elapsed_time: float = 0.0
-    estimated_remaining: str = "Calculating..."
     cpu_usage: float = 0.0
     memory_usage: float = 0.0
     gpu_usage: Optional[float] = None
@@ -121,147 +162,104 @@ class EnhancedDisplay:
             except (ImportError, Exception):
                 self.stats.gpu_usage = None
 
+    def _border(self, left: str, right: str, color: str = Fore.CYAN) -> str:
+        return f"{color}{left}{'═' * (BOX_WIDTH - 2)}{right}{Style.RESET_ALL}"
+
+    def _row(self, content: str, color: str = Fore.CYAN) -> str:
+        """One box line, padded or truncated so the right border always lines up"""
+        return f"{color}║{Style.RESET_ALL} {fit_to_width(content, CONTENT_WIDTH)}{Style.RESET_ALL} {color}║{Style.RESET_ALL}"
+
+    def _section(self, title: str, rows: List[str]) -> List[str]:
+        return [
+            self._border("╔", "╗"),
+            self._row(title),
+            self._border("╠", "╣"),
+            *[self._row(row) for row in rows],
+            self._border("╚", "╝"),
+            "",
+        ]
+
     def render_header(self) -> List[str]:
         """Render the professional header section with branding"""
-        lines = []
+        color = Fore.CYAN + Style.BRIGHT
+        version_line = f"v{__version__}  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        return [
+            self._border("╔", "╗", color),
+            self._row(f"{Fore.WHITE}{Style.BRIGHT}{__app_name__.center(CONTENT_WIDTH)}", color),
+            self._row(f"{Fore.LIGHTBLACK_EX}{version_line.center(CONTENT_WIDTH)}", color),
+            self._border("╚", "╝", color),
+            "",
+        ]
 
-        # Professional title with version and timestamp
-        title = f"{__app_name__}"
-        version_text = f"v{__version__}"
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def overall_progress(self) -> float:
+        """Batch percentage: finished and failed files plus the current file's progress."""
+        total = self.stats.total_files
+        if total <= 0:
+            return 0.0
+        done = self.stats.completed + self.stats.failed
+        partial = self.stats.current_progress / 100 if done < total else 0.0
+        return min(100.0, (done + partial) / total * 100)
 
-        # Create wider border for professional look
-        border_width = 78
-        border = "═" * border_width
-
-        # Header with gradient-style borders
-        lines.append(f"{Fore.CYAN}{Style.BRIGHT}╔{border}╗{Style.RESET_ALL}")
-
-        # Title line (centered)
-        # Total content should be 76 chars (excluding the 2 border spaces)
-        title_padding = (76 - len(title)) // 2
-        lines.append(
-            f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} "
-            f"{' ' * title_padding}{Fore.WHITE}{Style.BRIGHT}{title}{Style.RESET_ALL}"
-            f"{' ' * (76 - len(title) - title_padding)} "
-            f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}"
-        )
-
-        # Version and timestamp line
-        version_line = f"{version_text}  |  {timestamp}"
-        version_padding = (76 - len(version_line)) // 2
-        lines.append(
-            f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} "
-            f"{' ' * version_padding}{Fore.LIGHTBLACK_EX}{version_line}{Style.RESET_ALL}"
-            f"{' ' * (76 - len(version_line) - version_padding)} "
-            f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}"
-        )
-
-        lines.append(f"{Fore.CYAN}{Style.BRIGHT}╚{border}╝{Style.RESET_ALL}")
-        lines.append("")
-
-        return lines
+    def estimate_remaining(self, elapsed: float, overall_percentage: float) -> str:
+        """Estimate time left from the average pace so far."""
+        if overall_percentage >= 100:
+            return self.format_time(0)
+        if overall_percentage <= 0 or elapsed < 3:
+            return "Calculating..."
+        return self.format_time(elapsed * (100 - overall_percentage) / overall_percentage)
 
     def render_batch_progress(self) -> List[str]:
         """Render overall batch progress"""
-        lines = []
-
-        # Overall progress
-        overall_percentage = (self.stats.completed / self.stats.total_files * 100) if self.stats.total_files > 0 else 0
-
-        lines.append(f"{Fore.CYAN}╔{'═' * 78}╗{Style.RESET_ALL}")
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.YELLOW}{Style.BRIGHT}BATCH PROGRESS{Style.RESET_ALL}" + " " * 61 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-        lines.append(f"{Fore.CYAN}╠{'═' * 78}╣{Style.RESET_ALL}")
-
-        # Progress bar
-        bar = self.create_progress_bar(overall_percentage, width=60)
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {bar}" + " " * 9 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-
-        # Statistics
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.GREEN}Completed: {self.stats.completed:3d}{Style.RESET_ALL}  "
-                    f"{Fore.RED}Failed: {self.stats.failed:3d}{Style.RESET_ALL}  "
-                    f"{Fore.CYAN}Remaining: {self.stats.total_files - self.stats.completed - self.stats.failed:3d}{Style.RESET_ALL}  "
-                    f"{Fore.YELLOW}Total: {self.stats.total_files:3d}{Style.RESET_ALL}" + " " * 15 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-
-        lines.append(f"{Fore.CYAN}╚{'═' * 78}╝{Style.RESET_ALL}")
-        lines.append("")
-
-        return lines
+        stats = self.stats
+        remaining = max(0, stats.total_files - stats.completed - stats.failed)
+        return self._section(
+            f"{Fore.YELLOW}{Style.BRIGHT}BATCH PROGRESS",
+            [
+                self.create_progress_bar(self.overall_progress(), width=60),
+                f"{Fore.GREEN}Completed: {stats.completed:3d}{Style.RESET_ALL}  "
+                f"{Fore.RED}Failed: {stats.failed:3d}{Style.RESET_ALL}  "
+                f"{Fore.CYAN}Remaining: {remaining:3d}{Style.RESET_ALL}  "
+                f"{Fore.YELLOW}Total: {stats.total_files:3d}",
+            ],
+        )
 
     def render_current_file(self) -> List[str]:
         """Render current file conversion progress"""
-        lines = []
-
-        spinner = self.get_spinner()
-
-        lines.append(f"{Fore.CYAN}╔{'═' * 78}╗{Style.RESET_ALL}")
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.MAGENTA}{Style.BRIGHT}{spinner} CURRENT FILE{Style.RESET_ALL}" + " " * 60 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-        lines.append(f"{Fore.CYAN}╠{'═' * 78}╣{Style.RESET_ALL}")
-
-        # File name (truncate if too long)
-        filename = self.stats.current_file
-        if len(filename) > 70:
-            filename = filename[:67] + "..."
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.WHITE}{filename}{Style.RESET_ALL}" + " " * (74 - len(filename)) + f" {Fore.CYAN}║{Style.RESET_ALL}")
-
-        # Progress bar for current file
-        bar = self.create_progress_bar(self.stats.current_progress, width=60)
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {bar}" + " " * 9 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-
-        # Encoding details
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.YELLOW}Encoder:{Style.RESET_ALL} {self.stats.encoder:15s} "
-                    f"{Fore.YELLOW}Speed:{Style.RESET_ALL} {self.stats.current_speed:8s} "
-                    f"{Fore.YELLOW}FPS:{Style.RESET_ALL} {self.stats.fps:6s} "
-                    f"{Fore.YELLOW}Bitrate:{Style.RESET_ALL} {self.stats.bitrate:12s}" + " " * 2 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-
-        lines.append(f"{Fore.CYAN}╚{'═' * 78}╝{Style.RESET_ALL}")
-        lines.append("")
-
-        return lines
+        stats = self.stats
+        return self._section(
+            f"{Fore.MAGENTA}{Style.BRIGHT}{self.get_spinner()} CURRENT FILE",
+            [
+                f"{Fore.WHITE}{stats.current_file}",
+                self.create_progress_bar(stats.current_progress, width=60),
+                f"{Fore.YELLOW}Encoder:{Style.RESET_ALL} {stats.encoder:15s} "
+                f"{Fore.YELLOW}Speed:{Style.RESET_ALL} {stats.current_speed:7s} "
+                f"{Fore.YELLOW}FPS:{Style.RESET_ALL} {stats.fps:5s} "
+                f"{Fore.YELLOW}Bitrate:{Style.RESET_ALL} {stats.bitrate}",
+            ],
+        )
 
     def render_system_resources(self) -> List[str]:
         """Render system resource usage"""
-        lines = []
+        def usage_row(label: str, value: float) -> str:
+            bar = self.create_progress_bar(value, width=40, show_percentage=False)
+            return f"{Fore.YELLOW}{label:7s}{Style.RESET_ALL} {bar}{Style.RESET_ALL} {value:5.1f}%"
 
-        lines.append(f"{Fore.CYAN}╔{'═' * 78}╗{Style.RESET_ALL}")
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.GREEN}{Style.BRIGHT}SYSTEM RESOURCES{Style.RESET_ALL}" + " " * 58 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-        lines.append(f"{Fore.CYAN}╠{'═' * 78}╣{Style.RESET_ALL}")
-
-        # CPU usage
-        cpu_bar = self.create_progress_bar(self.stats.cpu_usage, width=40, show_percentage=False)
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.YELLOW}CPU:   {Style.RESET_ALL} {cpu_bar} {self.stats.cpu_usage:5.1f}%" + " " * 22 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-
-        # Memory usage
-        mem_bar = self.create_progress_bar(self.stats.memory_usage, width=40, show_percentage=False)
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.YELLOW}Memory:{Style.RESET_ALL} {mem_bar} {self.stats.memory_usage:5.1f}%" + " " * 22 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-
-        # GPU usage (if available)
+        rows = [usage_row("CPU:", self.stats.cpu_usage), usage_row("Memory:", self.stats.memory_usage)]
         if self.stats.gpu_usage is not None:
-            gpu_bar = self.create_progress_bar(self.stats.gpu_usage, width=40, show_percentage=False)
-            lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.YELLOW}GPU:   {Style.RESET_ALL} {gpu_bar} {self.stats.gpu_usage:5.1f}%" + " " * 22 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-
-        lines.append(f"{Fore.CYAN}╚{'═' * 78}╝{Style.RESET_ALL}")
-        lines.append("")
-
-        return lines
+            rows.append(usage_row("GPU:", self.stats.gpu_usage))
+        return self._section(f"{Fore.GREEN}{Style.BRIGHT}SYSTEM RESOURCES", rows)
 
     def render_time_info(self) -> List[str]:
         """Render time information"""
-        lines = []
-
         elapsed = time.time() - self.start_time
-
-        lines.append(f"{Fore.CYAN}╔{'═' * 78}╗{Style.RESET_ALL}")
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.BLUE}{Style.BRIGHT}TIME INFORMATION{Style.RESET_ALL}" + " " * 59 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-        lines.append(f"{Fore.CYAN}╠{'═' * 78}╣{Style.RESET_ALL}")
-
-        lines.append(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.YELLOW}Elapsed:{Style.RESET_ALL} {self.format_time(elapsed):15s} "
-                    f"{Fore.YELLOW}Estimated Remaining:{Style.RESET_ALL} {self.stats.estimated_remaining:15s}" + " " * 15 + f" {Fore.CYAN}║{Style.RESET_ALL}")
-
-        lines.append(f"{Fore.CYAN}╚{'═' * 78}╝{Style.RESET_ALL}")
-        lines.append("")
-
-        return lines
+        remaining = self.estimate_remaining(elapsed, self.overall_progress())
+        return self._section(
+            f"{Fore.BLUE}{Style.BRIGHT}TIME INFORMATION",
+            [
+                f"{Fore.YELLOW}Elapsed:{Style.RESET_ALL} {self.format_time(elapsed):15s} "
+                f"{Fore.YELLOW}Estimated Remaining:{Style.RESET_ALL} {remaining}",
+            ],
+        )
 
     def render_full_display(self) -> str:
         """Render the complete display"""
@@ -293,7 +291,6 @@ class EnhancedDisplay:
         encoder: Optional[str] = None,
         fps: Optional[str] = None,
         bitrate: Optional[str] = None,
-        estimated_remaining: Optional[str] = None,
     ):
         """Update statistics (thread-safe)"""
         with self.lock:
@@ -315,8 +312,6 @@ class EnhancedDisplay:
                 self.stats.fps = fps
             if bitrate is not None:
                 self.stats.bitrate = bitrate
-            if estimated_remaining is not None:
-                self.stats.estimated_remaining = estimated_remaining
 
     def display(self):
         """Display the current state"""

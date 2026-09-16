@@ -109,3 +109,36 @@ class TestModeFlag:
     def test_invalid_mode_rejected(self):
         with pytest.raises(SystemExit):
             main.parse_args(["--mode", "bogus"])
+
+
+class TestWorkerDisplayUpdates:
+    """Test what the worker sends to the live display"""
+
+    def test_partial_stats_do_not_reset_other_fields(self):
+        display = MagicMock()
+        converter = MagicMock(hw_accel="cuda")
+
+        def convert_file(input_file, stats_callback=None, **kwargs):
+            stats_callback({"encoder": "Remux (copy)", "progress": 0.0})
+            stats_callback({"fps": "395", "progress": 50.0})
+            return ConversionResult(True)
+        converter.convert_file.side_effect = convert_file
+
+        counts = {"completed": 0, "failed": 0, "skipped": 0}
+        main.process_file_worker(converter, Path("video.ts"), Event(), display, counts, Lock())
+
+        calls = [c.kwargs for c in display.update_stats.call_args_list]
+        assert {"encoder": "Remux (copy)", "current_progress": 0.0} in calls
+        assert {"fps": "395", "current_progress": 50.0} in calls
+
+    def test_finished_file_resets_current_progress(self):
+        display = MagicMock()
+        converter = MagicMock(hw_accel="cpu")
+        converter.convert_file.return_value = ConversionResult(True)
+
+        counts = {"completed": 0, "failed": 0, "skipped": 0}
+        main.process_file_worker(converter, Path("video.ts"), Event(), display, counts, Lock())
+
+        final = display.update_stats.call_args_list[-1].kwargs
+        assert final["completed"] == 1
+        assert final["current_progress"] == 0.0

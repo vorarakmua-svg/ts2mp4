@@ -567,6 +567,24 @@ class TestRemuxConversion:
         assert result.encoder == "copy"
         assert fake_successful_ffmpeg.call_count == 1
 
+    def test_reports_actual_encoder_for_each_attempt(self, input_dir, fake_successful_ffmpeg, mocker):
+        mocker.patch('converter.VideoValidator.get_video_info', return_value=probe_info("h264", "aac"))
+        def run_ffmpeg(self, cmd, **kwargs):
+            if "copy" in cmd:
+                return False, False, 0.0, "Non-monotonic DTS"
+            Path(cmd[-1]).write_bytes(b"ENCODED")
+            return True, False, 100.0, None
+        fake_successful_ffmpeg.side_effect = run_ffmpeg
+        input_file = input_dir / "video.ts"
+        input_file.write_bytes(b"DATA" * 1000)
+        updates = []
+
+        VideoConverter().convert_file(input_file, stats_callback=updates.append)
+
+        encoders = [u["encoder"] for u in updates if "encoder" in u]
+        assert encoders == ["Remux (copy)", "CPU (libx264)"]
+        assert all(u.get("progress") == 0.0 for u in updates if "encoder" in u)
+
     def test_remux_mode_with_unsupported_codec_fails_clearly(self, input_dir, fake_successful_ffmpeg, mocker, monkeypatch):
         monkeypatch.setattr(Config, 'MODE', "remux")
         mocker.patch('converter.VideoValidator.get_video_info', return_value=probe_info("mpeg2video", "mp2"))

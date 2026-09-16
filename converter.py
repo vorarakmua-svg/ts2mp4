@@ -215,6 +215,8 @@ class VideoConverter:
             cmd.append(str(temp_output_path))
 
             logger.info("Starting %s using %s", input_path.name, label)
+            if stats_callback:
+                stats_callback({"encoder": self.ENCODER_NAMES.get(encoder, encoder), "progress": 0.0})
             attempt_start = time.time()
 
             success, cancelled, last_progress, last_line = self._run_ffmpeg(
@@ -309,6 +311,7 @@ class VideoConverter:
     REMUX_VIDEO_CODECS = {"h264", "hevc"}
     REMUX_AUDIO_CODECS = {"aac", "mp3"}
     _ENCODE_AUDIO_OPTS = ["-c:a", "aac", "-b:a", "192k"]
+    ENCODER_NAMES = {"copy": "Remux (copy)", "h264_nvenc": "GPU (NVENC)", "libx264": "CPU (libx264)"}
 
     @staticmethod
     def _video_codec(input_info: Optional[Dict[str, Any]]) -> Optional[str]:
