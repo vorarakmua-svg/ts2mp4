@@ -14,6 +14,7 @@ from colorama import Fore, Style
 from config import Config
 from utils import setup_logging, get_input_files
 from converter import VideoConverter, ConversionResult
+from validator import VideoValidator
 from display import get_display
 from metrics import MetricsCollector
 from health import HealthMonitor
@@ -168,6 +169,9 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                         help="Keep the original .ts files after a successful conversion.")
     parser.add_argument("--overwrite", action="store_true", default=None,
                         help="Overwrite existing output files instead of skipping them.")
+    parser.add_argument("--mode", choices=Config.MODES, default=None,
+                        help="auto: copy streams when compatible, otherwise re-encode (default); "
+                             "remux: only copy streams; encode: always re-encode.")
     return parser.parse_args(argv)
 
 
@@ -193,6 +197,7 @@ def main():
         sleep_between=args.sleep_between,
         delete_originals=args.delete_originals,
         overwrite_existing=args.overwrite,
+        mode=args.mode,
     )
 
     logger = setup_logging()
@@ -244,9 +249,13 @@ def main():
             if output_path.exists() and not Config.OVERWRITE_EXISTING:
                 action = "Would skip (output already exists)"
             else:
-                action = f"Would convert using {describe_encoder(converter.hw_accel)}"
-                if not Config.DELETE_ORIGINALS:
-                    action += ", keeping original"
+                plan = converter.describe_plan(VideoValidator.get_video_info(input_file))
+                if plan is None:
+                    action = "Would fail (streams cannot be remuxed in --mode remux)"
+                else:
+                    action = f"Would {plan}"
+                    if not Config.DELETE_ORIGINALS:
+                        action += ", keeping original"
             print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}     → Action: {action}")
 
         print(f"{Fore.CYAN}{Style.BRIGHT}╚{'═' * 78}╝{Style.RESET_ALL}")

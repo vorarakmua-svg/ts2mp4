@@ -12,6 +12,8 @@ def _env_flag(name: str, default: str) -> bool:
 class Config:
     # All settings can be overridden via environment variables (see _read_environment)
 
+    MODES = ("auto", "remux", "encode")
+
     @classmethod
     def _read_environment(cls):
         # Paths
@@ -26,6 +28,10 @@ class Config:
         # FFmpeg Settings
         cls.FFMPEG_BIN = os.getenv("TS2MP4_FFMPEG_BIN", "ffmpeg")
         cls.FFPROBE_BIN = os.getenv("TS2MP4_FFPROBE_BIN", "ffprobe")
+
+        # Conversion mode: auto (remux when codecs allow, else re-encode), remux, or encode
+        mode = os.getenv("TS2MP4_MODE", "auto").lower()
+        cls.MODE = mode if mode in cls.MODES else "auto"
 
         # Encoding Settings
         cls.CRF_VALUE = int(os.getenv("TS2MP4_CRF_VALUE", "21"))
@@ -68,6 +74,7 @@ class Config:
         sleep_between: Optional[float] = None,
         delete_originals: Optional[bool] = None,
         overwrite_existing: Optional[bool] = None,
+        mode: Optional[str] = None,
     ):
         """Allow CLI overrides to adjust runtime configuration."""
         if input_dir:
@@ -86,6 +93,10 @@ class Config:
             cls.DELETE_ORIGINALS = delete_originals
         if overwrite_existing is not None:
             cls.OVERWRITE_EXISTING = overwrite_existing
+        if mode is not None:
+            if mode not in cls.MODES:
+                raise ValueError(f"Invalid mode {mode!r}; expected one of {', '.join(cls.MODES)}")
+            cls.MODE = mode
         cls.ensure_dirs()
 
 

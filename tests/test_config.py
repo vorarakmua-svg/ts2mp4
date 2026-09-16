@@ -195,3 +195,28 @@ class TestLoadEnvFile:
         assert Config.load_env_file(temp_dir / ".env") is False
 
         assert Config.CRF_VALUE == original_crf
+
+
+class TestModeSetting:
+    """Test remux/encode mode selection"""
+
+    def test_mode_from_environment(self, restore_config, temp_dir):
+        env_file = temp_dir / ".env"
+        env_file.write_text("TS2MP4_MODE=encode\n")
+
+        Config.load_env_file(env_file)
+
+        assert Config.MODE == "encode"
+
+    def test_invalid_mode_falls_back_to_auto(self, restore_config, temp_dir):
+        env_file = temp_dir / ".env"
+        env_file.write_text("TS2MP4_MODE=bogus\n")
+
+        Config.load_env_file(env_file)
+
+        assert Config.MODE == "auto"
+
+    def test_apply_overrides_mode(self, restore_config):
+        Config.apply_overrides(mode="remux")
+
+        assert Config.MODE == "remux"

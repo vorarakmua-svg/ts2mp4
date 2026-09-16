@@ -95,3 +95,17 @@ class TestProcessFileWorker:
     def test_skip_counts_as_skipped(self):
         result = ConversionResult(False, skipped=True, error="exists")
         assert self._run(result) == {"completed": 0, "failed": 0, "skipped": 1}
+
+
+class TestModeFlag:
+    """Test --mode flag"""
+
+    def test_mode_defaults_to_none(self):
+        assert main.parse_args([]).mode is None
+
+    def test_mode_choice(self):
+        assert main.parse_args(["--mode", "remux"]).mode == "remux"
+
+    def test_invalid_mode_rejected(self):
+        with pytest.raises(SystemExit):
+            main.parse_args(["--mode", "bogus"])

@@ -6,7 +6,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 from config import Config
 from validator import VideoValidator
 
@@ -183,11 +183,17 @@ class VideoConverter:
             logger.warning(message)
             return ConversionResult(False, output_path=output_path, skipped=True, error=message)
 
-        audio_opts = ["-c:a", "aac", "-b:a", "192k"]
         input_info = VideoValidator.get_video_info(input_path)
         source_duration = VideoValidator._extract_duration(input_info)
 
-        attempts = self._build_attempt_plan()
+        attempts = self._build_attempt_plan(input_info)
+        if not attempts:
+            message = (
+                f"{input_path.name} cannot be remuxed (video codec: {self._video_codec(input_info) or 'unknown'}); "
+                "use --mode auto or encode to re-encode it."
+            )
+            logger.error(message)
+            return ConversionResult(False, source_duration=source_duration, error=message)
         last_error = None
         hardware_failed = False
 
@@ -203,7 +209,6 @@ class VideoConverter:
                 "-y",
                 "-i", str(input_path),
                 *encoding_opts,
-                *audio_opts,
             ]
             if output_format:
                 cmd.extend(["-f", output_format])
@@ -232,9 +237,7 @@ class VideoConverter:
                 self._safe_unlink(temp_output_path)
                 if progress_callback and last_progress:
                     progress_callback(-last_progress)
-                if not use_hw:
-                    break
-                hardware_failed = True
+                hardware_failed = hardware_failed or use_hw
                 continue
 
             elapsed = time.time() - attempt_start
@@ -250,9 +253,7 @@ class VideoConverter:
                 self._safe_unlink(temp_output_path)
                 if progress_callback:
                     progress_callback(-100.0)
-                if not use_hw:
-                    break
-                hardware_failed = True
+                hardware_failed = hardware_failed or use_hw
                 continue
 
             # Atomic file replacement to avoid race conditions
@@ -297,26 +298,79 @@ class VideoConverter:
                 source_duration=source_duration,
                 realtime_factor=realtime_factor,
                 encoder=encoder,
-                retried_with_cpu=(not use_hw and hardware_failed),
+                retried_with_cpu=(encoder == "libx264" and hardware_failed),
             )
 
         message = last_error or "Conversion failed after all attempts."
         logger.error(message)
         return ConversionResult(False, source_duration=source_duration, error=message)
 
-    def _build_attempt_plan(self) -> List[Tuple[str, bool, str, List[str]]]:
-        """Create an ordered list of encoding attempts."""
+    # Codecs that can be stream-copied into an MP4 container
+    REMUX_VIDEO_CODECS = {"h264", "hevc"}
+    REMUX_AUDIO_CODECS = {"aac", "mp3"}
+    _ENCODE_AUDIO_OPTS = ["-c:a", "aac", "-b:a", "192k"]
+
+    @staticmethod
+    def _video_codec(input_info: Optional[Dict[str, Any]]) -> Optional[str]:
+        for stream in (input_info or {}).get("streams") or []:
+            if (stream or {}).get("codec_type") == "video":
+                return stream.get("codec_name")
+        return None
+
+    def _get_remux_options(self, input_info: Optional[Dict[str, Any]]) -> Optional[List[str]]:
+        """FFmpeg options to copy the streams into MP4, or None if the video codec can't be copied."""
+        video_codec = self._video_codec(input_info)
+        if video_codec not in self.REMUX_VIDEO_CODECS:
+            return None
+
+        audio_codecs = {
+            (stream or {}).get("codec_name")
+            for stream in input_info.get("streams") or []
+            if (stream or {}).get("codec_type") == "audio"
+        }
+        # Only video and audio: TS subtitle/teletext/data streams are not valid in MP4
+        opts = ["-map", "0:v:0", "-map", "0:a?", "-c:v", "copy"]
+        if video_codec == "hevc":
+            opts += ["-tag:v", "hvc1"]  # Required by Apple players
+        if audio_codecs <= self.REMUX_AUDIO_CODECS:
+            opts += ["-c:a", "copy"]
+        else:
+            opts += self._ENCODE_AUDIO_OPTS
+        return opts + ["-movflags", "+faststart"]
+
+    def _build_attempt_plan(
+        self, input_info: Optional[Dict[str, Any]] = None
+    ) -> List[Tuple[str, bool, str, List[str]]]:
+        """Create an ordered list of conversion attempts: remux first when possible, then encoders."""
         attempts: List[Tuple[str, bool, str, List[str]]] = []
+
+        if Config.MODE in ("auto", "remux"):
+            remux_opts = self._get_remux_options(input_info)
+            if remux_opts:
+                attempts.append(("Remux (stream copy)", False, "copy", remux_opts))
+        if Config.MODE == "remux":
+            return attempts
+
         if self.hw_accel == "cuda":
             retries = max(1, Config.GPU_MAX_ATTEMPTS)
             for attempt_idx in range(retries):
                 codec, opts = self._get_encoding_options(use_hw=True)
                 label = f"GPU (NVENC) attempt {attempt_idx + 1}/{retries}"
-                attempts.append((label, True, codec, opts))
+                attempts.append((label, True, codec, opts + self._ENCODE_AUDIO_OPTS))
 
         codec, opts = self._get_encoding_options(use_hw=False)
-        attempts.append(("CPU (libx264)", False, codec, opts))
+        attempts.append(("CPU (libx264)", False, codec, opts + self._ENCODE_AUDIO_OPTS))
         return attempts
+
+    def describe_plan(self, input_info: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Human-readable first choice for a file, or None if it can't be converted in the current mode."""
+        attempts = self._build_attempt_plan(input_info)
+        if not attempts:
+            return None
+        label, _, encoder, _ = attempts[0]
+        if encoder == "copy":
+            return "remux (stream copy)"
+        return f"re-encode using {'GPU (NVENC)' if encoder == 'h264_nvenc' else label}"
 
     def _get_encoding_options(self, use_hw: bool) -> Tuple[str, List[str]]:
         """Returns encoder name and ffmpeg options based on hardware availability."""

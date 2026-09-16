@@ -454,6 +454,133 @@ class TestBuildAttemptPlan:
         assert encoder == "libx264"
 
 
+def probe_info(video="h264", *audio):
+    """Build ffprobe-style metadata with the given codecs"""
+    streams = [{"codec_type": "video", "codec_name": video}] if video else []
+    streams += [{"codec_type": "audio", "codec_name": codec} for codec in audio]
+    return {"format": {"duration": "10"}, "streams": streams}
+
+
+def value_after(opts, flag):
+    return opts[opts.index(flag) + 1]
+
+
+class TestRemuxPlan:
+    """Test choosing stream copy (remux) versus re-encoding"""
+
+    @pytest.fixture
+    def cpu_converter(self, mocker):
+        mocker.patch.object(VideoConverter, '_detect_hardware', return_value='cpu')
+        return VideoConverter()
+
+    def test_default_mode_is_auto(self):
+        assert Config.MODE == "auto"
+
+    def test_h264_aac_is_remuxed_first_then_encoded(self, cpu_converter):
+        attempts = cpu_converter._build_attempt_plan(probe_info("h264", "aac"))
+
+        label, use_hw, encoder, opts = attempts[0]
+        assert encoder == "copy"
+        assert value_after(opts, "-c:v") == "copy"
+        assert value_after(opts, "-c:a") == "copy"
+        assert "+faststart" in opts
+        assert attempts[-1][2] == "libx264"
+
+    def test_remux_maps_only_video_and_audio(self, cpu_converter):
+        _, _, _, opts = cpu_converter._build_attempt_plan(probe_info("h264", "aac"))[0]
+
+        maps = [opts[i + 1] for i, flag in enumerate(opts) if flag == "-map"]
+        assert maps == ["0:v:0", "0:a?"]
+
+    def test_incompatible_audio_is_converted_while_video_is_copied(self, cpu_converter):
+        _, _, encoder, opts = cpu_converter._build_attempt_plan(probe_info("h264", "aac", "mp2"))[0]
+
+        assert encoder == "copy"
+        assert value_after(opts, "-c:v") == "copy"
+        assert value_after(opts, "-c:a") == "aac"
+
+    def test_hevc_is_tagged_for_apple_players(self, cpu_converter):
+        _, _, encoder, opts = cpu_converter._build_attempt_plan(probe_info("hevc", "aac"))[0]
+
+        assert encoder == "copy"
+        assert value_after(opts, "-tag:v") == "hvc1"
+
+    def test_unsupported_video_codec_is_encoded(self, cpu_converter):
+        attempts = cpu_converter._build_attempt_plan(probe_info("mpeg2video", "mp2"))
+
+        assert [a[2] for a in attempts] == ["libx264"]
+
+    def test_missing_metadata_is_encoded(self, cpu_converter):
+        attempts = cpu_converter._build_attempt_plan(None)
+
+        assert [a[2] for a in attempts] == ["libx264"]
+
+    def test_encode_mode_never_remuxes(self, cpu_converter, monkeypatch):
+        monkeypatch.setattr(Config, 'MODE', "encode")
+
+        attempts = cpu_converter._build_attempt_plan(probe_info("h264", "aac"))
+
+        assert [a[2] for a in attempts] == ["libx264"]
+
+    def test_remux_mode_never_encodes(self, cpu_converter, monkeypatch):
+        monkeypatch.setattr(Config, 'MODE', "remux")
+
+        attempts = cpu_converter._build_attempt_plan(probe_info("h264", "aac"))
+
+        assert [a[2] for a in attempts] == ["copy"]
+
+    def test_describe_plan(self, cpu_converter, monkeypatch):
+        assert cpu_converter.describe_plan(probe_info("h264", "aac")) == "remux (stream copy)"
+        assert cpu_converter.describe_plan(probe_info("mpeg2video", "mp2")) == "re-encode using CPU (libx264)"
+        monkeypatch.setattr(Config, 'MODE', "remux")
+        assert cpu_converter.describe_plan(probe_info("mpeg2video")) is None
+
+
+class TestRemuxConversion:
+    """Test convert_file behavior around remuxing"""
+
+    def test_failed_remux_falls_back_to_encoding(self, input_dir, output_dir, fake_successful_ffmpeg, mocker):
+        mocker.patch('converter.VideoValidator.get_video_info', return_value=probe_info("h264", "aac"))
+        def run_ffmpeg(self, cmd, **kwargs):
+            if "copy" in cmd:
+                return False, False, 0.0, "Non-monotonic DTS"
+            Path(cmd[-1]).write_bytes(b"ENCODED")
+            return True, False, 100.0, None
+        fake_successful_ffmpeg.side_effect = run_ffmpeg
+        input_file = input_dir / "video.ts"
+        input_file.write_bytes(b"DATA" * 1000)
+
+        result = VideoConverter().convert_file(input_file)
+
+        assert result.success is True
+        assert result.encoder == "libx264"
+        assert (output_dir / "video.mp4").read_bytes() == b"ENCODED"
+
+    def test_remux_success_reports_copy_encoder(self, input_dir, fake_successful_ffmpeg, mocker):
+        mocker.patch('converter.VideoValidator.get_video_info', return_value=probe_info("h264", "aac"))
+        input_file = input_dir / "video.ts"
+        input_file.write_bytes(b"DATA" * 1000)
+
+        result = VideoConverter().convert_file(input_file)
+
+        assert result.success is True
+        assert result.encoder == "copy"
+        assert fake_successful_ffmpeg.call_count == 1
+
+    def test_remux_mode_with_unsupported_codec_fails_clearly(self, input_dir, fake_successful_ffmpeg, mocker, monkeypatch):
+        monkeypatch.setattr(Config, 'MODE', "remux")
+        mocker.patch('converter.VideoValidator.get_video_info', return_value=probe_info("mpeg2video", "mp2"))
+        input_file = input_dir / "video.ts"
+        input_file.write_bytes(b"DATA" * 1000)
+
+        result = VideoConverter().convert_file(input_file)
+
+        assert result.success is False
+        assert "cannot be remuxed" in result.error
+        assert input_file.exists()
+        fake_successful_ffmpeg.assert_not_called()
+
+
 class TestGetEncodingOptions:
     """Test encoding options generation"""
 
