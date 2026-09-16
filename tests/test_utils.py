@@ -170,3 +170,32 @@ class TestFormatSize:
         assert format_size(1023.9) == "1023.90 B"
         # Just under 1 MB
         assert format_size(1024 * 1023.9) == "1023.90 KB"
+
+
+class TestPauseConsoleLogging:
+    """Console log output is paused while the live display is shown"""
+
+    def test_messages_go_to_file_but_not_console_while_paused(self, capsys):
+        from utils import pause_console_logging
+        logger = setup_logging()
+        log_file = Path(logger.handlers[0].baseFilename)
+
+        with pause_console_logging(logger):
+            logger.warning("during live display")
+        logger.info("after live display")
+
+        console = capsys.readouterr().out
+        assert "during live display" not in console
+        assert "after live display" in console
+        assert "during live display" in log_file.read_text(encoding="utf-8")
+
+    def test_console_logging_restored_after_exception(self, capsys):
+        from utils import pause_console_logging
+        logger = setup_logging()
+
+        with pytest.raises(RuntimeError):
+            with pause_console_logging(logger):
+                raise RuntimeError("boom")
+        logger.info("visible again")
+
+        assert "visible again" in capsys.readouterr().out

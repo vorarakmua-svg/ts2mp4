@@ -120,3 +120,51 @@ class TestEstimatedRemaining:
         output = ANSI.sub("", "\n".join(display.render_time_info()))
 
         assert "Estimated Remaining: 00:03:00" in output
+
+
+class TestFlickerFreeRendering:
+    """The live screen must overwrite in place instead of clearing"""
+
+    def test_frame_does_not_clear_the_screen(self, display):
+        frame = display.render_frame()
+
+        assert "\x1b[2J" not in frame
+
+    def test_frame_starts_at_top_left_and_clears_leftovers(self, display):
+        frame = display.render_frame()
+
+        assert frame.startswith("\x1b[H")
+        assert frame.endswith("\x1b[J")
+        body_lines = frame[len("\x1b[H"):-len("\x1b[J")].split("\n")
+        assert all(line.endswith("\x1b[K") for line in body_lines)
+
+    def test_display_writes_frame_in_one_write(self, display, mocker):
+        stdout = mocker.patch('display.sys.stdout')
+
+        display.display()
+
+        assert stdout.write.call_count == 1
+        assert stdout.write.call_args.args[0].startswith("\x1b[H")
+
+
+class TestCursorVisibility:
+    def test_start_hides_cursor_and_stop_restores_it_on_terminal(self, display, mocker):
+        stdout = mocker.patch('display.sys.stdout')
+        stdout.isatty.return_value = True
+
+        display.start()
+        display.stop()
+
+        written = "".join(c.args[0] for c in stdout.write.call_args_list)
+        assert "\x1b[?25l" in written
+        assert written.rstrip().endswith("\x1b[?25h")
+
+    def test_no_cursor_codes_when_output_is_redirected(self, display, mocker):
+        stdout = mocker.patch('display.sys.stdout')
+        stdout.isatty.return_value = False
+
+        display.start()
+        display.stop()
+
+        written = "".join(c.args[0] for c in stdout.write.call_args_list)
+        assert "\x1b[?25" not in written

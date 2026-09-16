@@ -6,13 +6,14 @@ import argparse
 import sys
 import time
 import signal
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Lock, Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Sequence, Tuple
 from colorama import Fore, Style
 from config import Config
-from utils import setup_logging, get_input_files
+from utils import setup_logging, get_input_files, pause_console_logging
 from converter import VideoConverter, ConversionResult
 from validator import VideoValidator
 from display import get_display
@@ -59,6 +60,17 @@ def health_check_loop(health_monitor, stop_event: Event):
         except Exception as e:
             # Silently continue on health check errors
             pass
+
+
+@contextmanager
+def live_display_session(display, logger):
+    """Show the live display with console logging paused; always restores the cursor and logging."""
+    with pause_console_logging(logger):
+        display.start()
+        try:
+            yield
+        finally:
+            display.stop()
 
 
 def determine_worker_count(hw_accel: str, max_concurrent: int) -> int:
@@ -293,88 +305,90 @@ def main():
     failed_files = []
     skipped_files = []
 
-    # Start display update thread
-    display_stop = Event()
-    display_thread = Thread(target=display_update_loop, args=(display, display_stop), daemon=True)
-    display_thread.start()
+    # Live display: hide cursor and keep log lines off the screen (they still go to the log file)
+    with live_display_session(display, logger):
+        # Start display update thread
+        display_stop = Event()
+        display_thread = Thread(target=display_update_loop, args=(display, display_stop), daemon=True)
+        display_thread.start()
 
-    # Start health check thread
-    health_stop = Event()
-    health_thread = Thread(target=health_check_loop, args=(health_monitor, health_stop), daemon=True)
-    health_thread.start()
+        # Start health check thread
+        health_stop = Event()
+        health_thread = Thread(target=health_check_loop, args=(health_monitor, health_stop), daemon=True)
+        health_thread.start()
 
-    logger.info("Starting conversion with %d workers...", max_workers)
+        logger.info("Starting conversion with %d workers...", max_workers)
 
-    try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_file = {
-                executor.submit(
-                    process_file_worker,
-                    converter,
-                    input_file,
-                    STOP_EVENT,
-                    display,
-                    counts,
-                    count_lock,
-                    metrics_collector,
-                ): input_file
-                for input_file in files
-            }
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                future_to_file = {
+                    executor.submit(
+                        process_file_worker,
+                        converter,
+                        input_file,
+                        STOP_EVENT,
+                        display,
+                        counts,
+                        count_lock,
+                        metrics_collector,
+                    ): input_file
+                    for input_file in files
+                }
 
-            # Process completed tasks as they finish
-            for future in as_completed(future_to_file):
-                if STOP_EVENT.is_set():
-                    # Cancel remaining futures
-                    for f in future_to_file:
-                        f.cancel()
-                    break
+                # Process completed tasks as they finish
+                for future in as_completed(future_to_file):
+                    if STOP_EVENT.is_set():
+                        # Cancel remaining futures
+                        for f in future_to_file:
+                            f.cancel()
+                        break
 
-                input_file = future_to_file[future]
+                    input_file = future_to_file[future]
 
-                try:
-                    input_file, result = future.result()
+                    try:
+                        input_file, result = future.result()
 
-                    if result.success:
-                        speed = f"{result.realtime_factor:.2f}x" if result.realtime_factor else "N/A"
-                        logger.info(
-                            "Converted %s in %.2fs (speed: %s) using %s%s",
-                            input_file.name,
-                            result.elapsed_seconds,
-                            speed,
-                            result.encoder,
-                            " after GPU fallback" if result.retried_with_cpu else "",
-                        )
-                        completed_files.append(input_file)
-                    elif result.skipped:
-                        skipped_files.append(input_file)
-                    else:
-                        exit_code = exit_code or (130 if result.cancelled else 1)
-                        reason = result.error or "Unknown error"
+                        if result.success:
+                            speed = f"{result.realtime_factor:.2f}x" if result.realtime_factor else "N/A"
+                            logger.info(
+                                "Converted %s in %.2fs (speed: %s) using %s%s",
+                                input_file.name,
+                                result.elapsed_seconds,
+                                speed,
+                                result.encoder,
+                                " after GPU fallback" if result.retried_with_cpu else "",
+                            )
+                            completed_files.append(input_file)
+                        elif result.skipped:
+                            skipped_files.append(input_file)
+                        else:
+                            exit_code = exit_code or (130 if result.cancelled else 1)
+                            reason = result.error or "Unknown error"
 
-                        if not result.cancelled:
-                            logger.error("Failed to convert %s: %s", input_file.name, reason)
-                            failed_files.append(input_file)
+                            if not result.cancelled:
+                                logger.error("Failed to convert %s: %s", input_file.name, reason)
+                                failed_files.append(input_file)
 
-                except Exception as e:
-                    logger.error(f"Unexpected error processing {input_file}: {e}", exc_info=True)
-                    failed_files.append(input_file)
-                    exit_code = 1
+                    except Exception as e:
+                        logger.error(f"Unexpected error processing {input_file}: {e}", exc_info=True)
+                        failed_files.append(input_file)
+                        exit_code = 1
 
-                if STOP_EVENT.is_set():
-                    break
+                    if STOP_EVENT.is_set():
+                        break
 
-    finally:
-        # Stop display thread
-        display_stop.set()
-        display_thread.join(timeout=1)
+        finally:
+            # Stop display thread
+            display_stop.set()
+            display_thread.join(timeout=1)
 
-        # Stop health check thread
-        health_stop.set()
-        health_thread.join(timeout=1)
+            # Stop health check thread
+            health_stop.set()
+            health_thread.join(timeout=1)
 
-        # Clear screen and show professional final summary
-        display.clear_screen()
+            # Clear screen and show professional final summary
+            display.clear_screen()
 
     # Print professional final summary
     print(f"\n{Fore.CYAN}{Style.BRIGHT}╔{'═' * 78}╗{Style.RESET_ALL}")

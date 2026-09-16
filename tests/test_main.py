@@ -142,3 +142,21 @@ class TestWorkerDisplayUpdates:
         final = display.update_stats.call_args_list[-1].kwargs
         assert final["completed"] == 1
         assert final["current_progress"] == 0.0
+
+
+class TestLiveDisplaySession:
+    """The live display session always cleans up"""
+
+    def test_restores_cursor_and_logging_after_error(self, mocker):
+        display = MagicMock()
+        logger = MagicMock()
+        pause = mocker.patch('main.pause_console_logging')
+
+        with pytest.raises(RuntimeError):
+            with main.live_display_session(display, logger):
+                raise RuntimeError("boom")
+
+        display.start.assert_called_once()
+        display.stop.assert_called_once()
+        pause.assert_called_once_with(logger)
+        assert pause.return_value.__exit__.called

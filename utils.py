@@ -1,5 +1,6 @@
 import logging
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from colorama import init as colorama_init, Fore, Style
@@ -25,6 +26,23 @@ class _ColorFormatter(logging.Formatter):
         return f"{color}{message}{Style.RESET_ALL}"
 
 
+_CONSOLE_HANDLER_NAME = "console"
+
+
+@contextmanager
+def pause_console_logging(logger: logging.Logger):
+    """Temporarily silence console log output (the log file still receives everything)."""
+    console_handlers = [h for h in logger.handlers if h.get_name() == _CONSOLE_HANDLER_NAME]
+    previous_levels = [h.level for h in console_handlers]
+    for handler in console_handlers:
+        handler.setLevel(logging.CRITICAL + 1)
+    try:
+        yield
+    finally:
+        for handler, level in zip(console_handlers, previous_levels):
+            handler.setLevel(level)
+
+
 def setup_logging():
     """Configures the logging system without duplicating handlers."""
     colorama_init(autoreset=True)
@@ -44,6 +62,7 @@ def setup_logging():
     file_handler.setFormatter(base_formatter)
 
     stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.set_name(_CONSOLE_HANDLER_NAME)
     stream_handler.setFormatter(_ColorFormatter("%(asctime)s [%(levelname)s] %(message)s"))
 
     logger.addHandler(file_handler)

@@ -313,15 +313,34 @@ class EnhancedDisplay:
             if bitrate is not None:
                 self.stats.bitrate = bitrate
 
-    def display(self):
-        """Display the current state"""
+    def render_frame(self) -> str:
+        """
+        Full display as one terminal update that overwrites the previous frame in place:
+        cursor home, each line followed by erase-to-end-of-line, then erase anything below.
+        Never clears the whole screen, which is what causes flicker.
+        """
         with self.lock:
             output = self.render_full_display()
+        return "\033[H" + "\n".join(f"{line}\033[K" for line in output.split("\n")) + "\033[J"
 
-        # Clear screen and show new content
-        self.clear_screen()
-        print(output)
+    def display(self):
+        """Display the current state"""
+        sys.stdout.write(self.render_frame())
         sys.stdout.flush()
+
+    def start(self):
+        """Begin the live display: clear once and hide the cursor."""
+        codes = "\033[2J\033[H"
+        if sys.stdout.isatty():
+            codes += "\033[?25l"
+        sys.stdout.write(codes)
+        sys.stdout.flush()
+
+    def stop(self):
+        """End the live display and restore the cursor."""
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
 
 
 # Singleton instance for easy access
