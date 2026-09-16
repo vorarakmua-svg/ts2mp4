@@ -2,7 +2,7 @@
 
 Batch-converts `.ts` (MPEG transport stream) files to `.mp4` using FFmpeg, with NVIDIA NVENC acceleration and automatic CPU fallback.
 
-Each output is validated (it must exist, contain a video stream, and match the source duration within 1%) before the original `.ts` file is deleted.
+Each output is validated (it must exist, contain a video stream, and match the source duration within 1%) before the original `.ts` file is deleted (use `--keep-originals` to keep it). Files whose `.mp4` already exists in the output directory are skipped unless you pass `--overwrite`.
 
 ## Requirements
 
@@ -33,6 +33,8 @@ On Windows you can also double-click `run.bat`. Converted files are written to t
 | `--log-dir PATH` | Directory for logs, metrics, and health reports |
 | `--ffmpeg-bin PATH` | Path to the `ffmpeg` executable |
 | `--ffprobe-bin PATH` | Path to the `ffprobe` executable |
+| `--keep-originals` | Keep the `.ts` file after a successful conversion |
+| `--overwrite` | Re-convert files whose output already exists |
 | `--dry-run` | List what would be converted without changing anything |
 | `--profile` | Write a cProfile performance report to the log directory |
 | `--wizard` | Interactive configuration helper |
@@ -51,9 +53,13 @@ On Windows you can also double-click `run.bat`. Converted files are written to t
 | `TS2MP4_GPU_MAX_ATTEMPTS` | `1` | GPU attempts before falling back to CPU |
 | `TS2MP4_NVENC_PRESET` | `p4` | NVENC preset, `p1` (fastest) to `p7` (best quality) |
 | `TS2MP4_CRF_VALUE` | `21` | Quality target (lower is better quality, larger files) |
-| `TS2MP4_MAX_CONCURRENT` | `1` | Number of files converted in parallel |
+| `TS2MP4_DELETE_ORIGINALS` | `1` | Set to `0` to keep original `.ts` files |
+| `TS2MP4_OVERWRITE` | `0` | Set to `1` to overwrite existing outputs |
+| `TS2MP4_MAX_CONCURRENT` | `1` | Number of files converted in parallel (capped at 2 on GPU) |
 
-Command-line options take precedence over environment variables.
+These can also be placed in a `.env` file in the directory you run the program from (`python main.py --wizard` creates one).
+
+Precedence: command-line options > environment variables > `.env` file > defaults.
 
 ## Output
 

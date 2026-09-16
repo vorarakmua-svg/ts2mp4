@@ -59,8 +59,9 @@ class TestGetVideoInfo:
 
         mocker.patch('subprocess.run', return_value=mock_result)
 
-        with pytest.raises(json.JSONDecodeError):
-            VideoValidator.get_video_info(sample_ts_file)
+        info = VideoValidator.get_video_info(sample_ts_file)
+
+        assert info is None
 
     def test_get_video_info_calls_ffprobe_with_correct_args(self, sample_ts_file, mocker):
         """Test that ffprobe is called with correct arguments"""

@@ -7,9 +7,9 @@ import sys
 import time
 import signal
 from pathlib import Path
-from threading import Event, Lock, Semaphore, Thread
+from threading import Event, Lock, Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Tuple
+from typing import Optional, Sequence, Tuple
 from colorama import Fore, Style
 from config import Config
 from utils import setup_logging, get_input_files
@@ -24,7 +24,7 @@ STOP_EVENT = Event()
 
 def signal_handler(signum, frame):
     if not STOP_EVENT.is_set():
-        print(f"\n\n{Fore.YELLOW}[!] Stop requested. Finishing current file and exiting...{Style.RESET_ALL}")
+        print(f"\n\n{Fore.YELLOW}[!] Stop requested. Cancelling current conversion and exiting...{Style.RESET_ALL}")
     STOP_EVENT.set()
 
 
@@ -60,14 +60,36 @@ def health_check_loop(health_monitor, stop_event: Event):
             pass
 
 
+def determine_worker_count(hw_accel: str, max_concurrent: int) -> int:
+    """Number of parallel conversions; GPU is capped at 2 to avoid exhausting encoder sessions/memory."""
+    workers = max(1, max_concurrent)
+    if hw_accel == "cuda":
+        workers = min(workers, 2)
+    return workers
+
+
+def describe_encoder(hw_accel: str) -> str:
+    return "GPU (NVENC)" if hw_accel == "cuda" else "CPU (libx264)"
+
+
+def final_status(failed: int, skipped: int, interrupted: bool) -> Tuple[str, bool]:
+    """Returns the end-of-run message and whether the run fully succeeded."""
+    if interrupted:
+        return "Processing interrupted by user.", False
+    if failed:
+        return f"Finished with {failed} failed file(s). See the log for details.", False
+    message = "All tasks completed successfully!"
+    if skipped:
+        message += f" ({skipped} file(s) skipped because the output already exists)"
+    return message, True
+
+
 def process_file_worker(
     converter: VideoConverter,
     input_file: Path,
     cancel_event: Event,
-    gpu_semaphore: Semaphore,
     display,
-    completed_count: dict,
-    failed_count: dict,
+    counts: dict,
     count_lock: Lock,
     metrics_collector=None,
 ) -> Tuple[Path, ConversionResult]:
@@ -89,25 +111,15 @@ def process_file_worker(
             bitrate=stats.get('bitrate', '0 kbits/s'),
         )
 
-    # Perform conversion
-    if converter.hw_accel == "cuda":
-        with gpu_semaphore:
-            result = converter.convert_file(
-                input_file,
-                progress_callback=None,
-                stats_callback=stats_callback,
-                cancel_event=cancel_event,
-            )
-    else:
-        result = converter.convert_file(
-            input_file,
-            progress_callback=None,
-            stats_callback=stats_callback,
-            cancel_event=cancel_event,
-        )
+    result = converter.convert_file(
+        input_file,
+        progress_callback=None,
+        stats_callback=stats_callback,
+        cancel_event=cancel_event,
+    )
 
-    # Record metrics
-    if metrics_collector:
+    # Record metrics (skipped files were never converted)
+    if metrics_collector and not result.skipped:
         metrics_collector.record_conversion(
             input_path=input_file,
             output_path=result.output_path,
@@ -123,19 +135,22 @@ def process_file_worker(
     # Update counts
     with count_lock:
         if result.success:
-            completed_count['value'] += 1
+            counts['completed'] += 1
+        elif result.skipped:
+            counts['skipped'] += 1
         else:
-            failed_count['value'] += 1
+            counts['failed'] += 1
 
+        # The live display has no skipped column; count skipped files as done so progress adds up
         display.update_stats(
-            completed=completed_count['value'],
-            failed=failed_count['value'],
+            completed=counts['completed'] + counts['skipped'],
+            failed=counts['failed'],
         )
 
     return input_file, result
 
 
-def parse_args():
+def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(
         description="TS2MP4 Professional Video Converter - Batch convert .ts files to .mp4 with real-time monitoring.",
         epilog="Experience professional-grade conversion with live statistics and resource monitoring."
@@ -149,7 +164,11 @@ def parse_args():
     parser.add_argument("--profile", action="store_true", help="Enable performance profiling.")
     parser.add_argument("--dry-run", action="store_true", help="Simulate conversion without actually converting files.")
     parser.add_argument("--wizard", action="store_true", help="Run interactive configuration wizard.")
-    return parser.parse_args()
+    parser.add_argument("--keep-originals", dest="delete_originals", action="store_false", default=None,
+                        help="Keep the original .ts files after a successful conversion.")
+    parser.add_argument("--overwrite", action="store_true", default=None,
+                        help="Overwrite existing output files instead of skipping them.")
+    return parser.parse_args(argv)
 
 
 def main():
@@ -163,6 +182,8 @@ def main():
         wizard.run()
         sys.exit(0)
 
+    # Settings saved by the wizard; real environment variables and CLI flags take precedence
+    Config.load_env_file(Path.cwd() / ".env")
     Config.apply_overrides(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
@@ -170,6 +191,8 @@ def main():
         ffmpeg_bin=args.ffmpeg_bin,
         ffprobe_bin=args.ffprobe_bin,
         sleep_between=args.sleep_between,
+        delete_originals=args.delete_originals,
+        overwrite_existing=args.overwrite,
     )
 
     logger = setup_logging()
@@ -198,6 +221,12 @@ def main():
     print(f"{Fore.CYAN}Found {len(files)} files to convert.{Style.RESET_ALL}")
     logger.info(f"Found {len(files)} files.")
 
+    try:
+        converter = VideoConverter()
+    except Exception as e:
+        logger.critical(f"Failed to initialize converter: {e}")
+        sys.exit(1)
+
     # Handle dry-run mode
     if args.dry_run:
         print(f"\n{Fore.CYAN}{Style.BRIGHT}╔{'═' * 78}╗{Style.RESET_ALL}")
@@ -212,18 +241,18 @@ def main():
             print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.GREEN}[{idx}/{len(files)}]{Style.RESET_ALL} {input_file.name}")
             print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}     → Size: {file_size_mb:.2f} MB")
             print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}     → Output: {output_path}")
-            print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}     → Action: Would convert using {'GPU (NVENC)' if Config.ENABLE_GPU else 'CPU (libx264)'}")
+            if output_path.exists() and not Config.OVERWRITE_EXISTING:
+                action = "Would skip (output already exists)"
+            else:
+                action = f"Would convert using {describe_encoder(converter.hw_accel)}"
+                if not Config.DELETE_ORIGINALS:
+                    action += ", keeping original"
+            print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}     → Action: {action}")
 
         print(f"{Fore.CYAN}{Style.BRIGHT}╚{'═' * 78}╝{Style.RESET_ALL}")
         print(f"\n{Fore.YELLOW}Dry-run complete. No files were modified.{Style.RESET_ALL}")
         logger.info("Dry-run simulation completed")
         sys.exit(0)
-
-    try:
-        converter = VideoConverter()
-    except Exception as e:
-        logger.critical(f"Failed to initialize converter: {e}")
-        sys.exit(1)
 
     # Initialize metrics collector
     metrics_collector = MetricsCollector(Config.LOG_DIR)
@@ -243,26 +272,17 @@ def main():
         encoder=converter.hw_accel.upper() if converter.hw_accel == "cuda" else "CPU",
     )
 
-    # Determine concurrency based on hardware
-    max_workers = Config.MAX_CONCURRENT_CONVERSIONS
-    if converter.hw_accel == "cuda":
-        # Limit GPU concurrency to avoid memory issues
-        max_workers = min(max_workers, 2)
-        logger.info(f"GPU detected: limiting concurrency to {max_workers} workers")
-    else:
-        logger.info(f"Using CPU encoding with {max_workers} workers")
-
-    # GPU semaphore to control GPU resource usage
-    gpu_semaphore = Semaphore(1 if converter.hw_accel == "cuda" else max_workers)
+    max_workers = determine_worker_count(converter.hw_accel, Config.MAX_CONCURRENT_CONVERSIONS)
+    logger.info("Using %s encoding with %d worker(s)", describe_encoder(converter.hw_accel), max_workers)
 
     # Thread-safe counters
     count_lock = Lock()
-    completed_count = {'value': 0}
-    failed_count = {'value': 0}
+    counts = {'completed': 0, 'failed': 0, 'skipped': 0}
 
     exit_code = 0
     completed_files = []
     failed_files = []
+    skipped_files = []
 
     # Start display update thread
     display_stop = Event()
@@ -285,10 +305,8 @@ def main():
                     converter,
                     input_file,
                     STOP_EVENT,
-                    gpu_semaphore,
                     display,
-                    completed_count,
-                    failed_count,
+                    counts,
                     count_lock,
                     metrics_collector,
                 ): input_file
@@ -319,6 +337,8 @@ def main():
                             " after GPU fallback" if result.retried_with_cpu else "",
                         )
                         completed_files.append(input_file)
+                    elif result.skipped:
+                        skipped_files.append(input_file)
                     else:
                         exit_code = exit_code or (130 if result.cancelled else 1)
                         reason = result.error or "Unknown error"
@@ -353,15 +373,17 @@ def main():
     print(f"{Fore.CYAN}{Style.BRIGHT}╠{'═' * 78}╣{Style.RESET_ALL}")
     print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.GREEN}✓ Completed:{Style.RESET_ALL} {len(completed_files):3d} files" + " " * 55 + f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}")
     print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.RED}✗ Failed:{Style.RESET_ALL}    {len(failed_files):3d} files" + " " * 55 + f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.BLUE}↷ Skipped:{Style.RESET_ALL}   {len(skipped_files):3d} files" + " " * 55 + f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}")
     print(f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL} {Fore.YELLOW}⊕ Total:{Style.RESET_ALL}     {len(files):3d} files" + " " * 55 + f"{Fore.CYAN}{Style.BRIGHT}║{Style.RESET_ALL}")
     print(f"{Fore.CYAN}{Style.BRIGHT}╚{'═' * 78}╝{Style.RESET_ALL}")
 
-    if STOP_EVENT.is_set():
-        print(f"\n{Fore.YELLOW}{Style.BRIGHT}⚠ Processing interrupted by user.{Style.RESET_ALL}")
-        logger.warning("Processing interrupted by user.")
+    message, ok = final_status(len(failed_files), len(skipped_files), STOP_EVENT.is_set())
+    if ok:
+        print(f"\n{Fore.GREEN}{Style.BRIGHT}✓ {message}{Style.RESET_ALL}")
+        logger.info(message)
     else:
-        print(f"\n{Fore.GREEN}{Style.BRIGHT}✓ All tasks completed successfully!{Style.RESET_ALL}")
-        logger.info("Batch conversion finished.")
+        print(f"\n{Fore.YELLOW}{Style.BRIGHT}⚠ {message}{Style.RESET_ALL}")
+        logger.warning(message)
 
     # Export metrics
     if metrics_collector.total_conversions > 0:

@@ -1,4 +1,5 @@
 """Tests for converter.py module"""
+import io
 import pytest
 import subprocess
 import time
@@ -275,6 +276,71 @@ class TestCheckDiskSpace:
             VideoConverter._check_disk_space(input_file, output_dir)
 
 
+@pytest.fixture
+def fake_successful_ffmpeg(mocker):
+    """Make conversions succeed without FFmpeg: write the output file and pass validation"""
+    def run_ffmpeg(self, cmd, **kwargs):
+        Path(cmd[-1]).write_bytes(b"CONVERTED")
+        return True, False, 100.0, None
+
+    mocker.patch.object(VideoConverter, '_detect_hardware', return_value='cpu')
+    mocker.patch.object(VideoConverter, '_check_disk_space')
+    mocker.patch('converter.VideoValidator.get_video_info', return_value={"format": {"duration": "10"}})
+    mocker.patch('converter.VideoValidator.validate_conversion', return_value=True)
+    return mocker.patch.object(VideoConverter, '_run_ffmpeg', autospec=True, side_effect=run_ffmpeg)
+
+
+class TestConvertFileOutputHandling:
+    """Test what happens to originals and existing outputs"""
+
+    def test_success_deletes_original_by_default(self, input_dir, output_dir, fake_successful_ffmpeg):
+        input_file = input_dir / "video.ts"
+        input_file.write_bytes(b"DATA" * 1000)
+
+        result = VideoConverter().convert_file(input_file)
+
+        assert result.success is True
+        assert (output_dir / "video.mp4").read_bytes() == b"CONVERTED"
+        assert not input_file.exists()
+
+    def test_success_keeps_original_when_configured(self, input_dir, output_dir, fake_successful_ffmpeg, monkeypatch):
+        monkeypatch.setattr(Config, 'DELETE_ORIGINALS', False, raising=False)
+        input_file = input_dir / "video.ts"
+        input_file.write_bytes(b"DATA" * 1000)
+
+        result = VideoConverter().convert_file(input_file)
+
+        assert result.success is True
+        assert (output_dir / "video.mp4").exists()
+        assert input_file.exists()
+
+    def test_existing_output_is_skipped(self, input_dir, output_dir, fake_successful_ffmpeg):
+        input_file = input_dir / "video.ts"
+        input_file.write_bytes(b"DATA" * 1000)
+        existing = output_dir / "video.mp4"
+        existing.write_bytes(b"EXISTING")
+
+        result = VideoConverter().convert_file(input_file)
+
+        assert result.success is False
+        assert result.skipped is True
+        assert existing.read_bytes() == b"EXISTING"
+        assert input_file.exists()
+        fake_successful_ffmpeg.assert_not_called()
+
+    def test_existing_output_is_overwritten_when_configured(self, input_dir, output_dir, fake_successful_ffmpeg, monkeypatch):
+        monkeypatch.setattr(Config, 'OVERWRITE_EXISTING', True, raising=False)
+        input_file = input_dir / "video.ts"
+        input_file.write_bytes(b"DATA" * 1000)
+        existing = output_dir / "video.mp4"
+        existing.write_bytes(b"EXISTING")
+
+        result = VideoConverter().convert_file(input_file)
+
+        assert result.success is True
+        assert existing.read_bytes() == b"CONVERTED"
+
+
 class TestConvertFile:
     """Test file conversion"""
 
@@ -302,6 +368,18 @@ class TestConvertFile:
 
         assert result.success is False
         assert "does not exist" in result.error
+
+    def test_convert_file_input_is_directory(self, input_dir, mocker):
+        """Test conversion fails with a clear message when input is a directory"""
+        mocker.patch.object(VideoConverter, '_detect_hardware', return_value='cpu')
+        converter = VideoConverter()
+        input_path = input_dir / "folder.ts"
+        input_path.mkdir()
+
+        result = converter.convert_file(input_path)
+
+        assert result.success is False
+        assert "not a file" in result.error
 
     def test_convert_file_wrong_extension(self, input_dir, mocker):
         """Test conversion skips wrong file extension"""
@@ -424,11 +502,11 @@ class TestRunFFmpeg:
         # Mock subprocess
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.stderr = iter([
+        mock_proc.stderr = io.StringIO("".join([
             "Duration: 00:00:10.00\n",
             "time=00:00:05.00 fps=30\n",
             "time=00:00:10.00 fps=30\n",
-        ])
+        ]))
 
         mocker.patch('subprocess.Popen', return_value=mock_proc)
 
@@ -475,11 +553,11 @@ class TestRunFFmpeg:
 
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.stderr = iter([
+        mock_proc.stderr = io.StringIO("".join([
             "Duration: 00:00:10.00\n",
             "time=00:00:05.00\n",  # 50% progress
             "time=00:00:10.00\n",  # 100% progress
-        ])
+        ]))
 
         mocker.patch('subprocess.Popen', return_value=mock_proc)
 
@@ -506,10 +584,10 @@ class TestRunFFmpeg:
 
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.stderr = iter([
+        mock_proc.stderr = io.StringIO("".join([
             "Duration: 00:00:10.00\n",
             "time=00:00:05.00 fps=30 bitrate=5000.0kbits/s speed=2.0x\n",
-        ])
+        ]))
 
         mocker.patch('subprocess.Popen', return_value=mock_proc)
 

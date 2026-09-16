@@ -4,6 +4,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
+from config import Config
 
 
 @pytest.fixture
@@ -12,6 +13,14 @@ def temp_dir():
     tmp = tempfile.mkdtemp()
     yield Path(tmp)
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def isolated_config_dirs(temp_dir, monkeypatch):
+    """Point Config directories at the test's temp dir so tests never touch real paths"""
+    monkeypatch.setattr(Config, 'INPUT_DIR', temp_dir / "input")
+    monkeypatch.setattr(Config, 'OUTPUT_DIR', temp_dir / "output")
+    monkeypatch.setattr(Config, 'LOG_DIR', temp_dir / "logs")
 
 
 @pytest.fixture

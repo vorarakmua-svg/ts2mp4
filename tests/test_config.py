@@ -140,3 +140,58 @@ class TestConfig:
         monkeypatch.setenv("TS2MP4_FORCE_GPU", "1")
         result = os.getenv("TS2MP4_FORCE_GPU", "0") in ("1", "true", "True")
         assert result is True
+
+
+@pytest.fixture
+def restore_config(mocker):
+    """Snapshot Config attributes and os.environ, restoring both after the test"""
+    snapshot = {k: v for k, v in vars(Config).items() if k.isupper()}
+    mocker.patch.dict(os.environ)
+    for key in [k for k in os.environ if k.startswith("TS2MP4_")]:
+        del os.environ[key]
+    yield
+    for key, value in snapshot.items():
+        setattr(Config, key, value)
+
+
+class TestOutputHandlingOverrides:
+    """Test keep-originals and overwrite settings"""
+
+    def test_output_handling_defaults(self):
+        assert Config.DELETE_ORIGINALS is True
+        assert Config.OVERWRITE_EXISTING is False
+
+    def test_apply_overrides_output_handling(self, restore_config):
+        Config.apply_overrides(delete_originals=False, overwrite_existing=True)
+
+        assert Config.DELETE_ORIGINALS is False
+        assert Config.OVERWRITE_EXISTING is True
+
+
+class TestLoadEnvFile:
+    """Test loading settings from a .env file"""
+
+    def test_env_file_settings_are_applied(self, temp_dir, restore_config):
+        env_file = temp_dir / ".env"
+        env_file.write_text("TS2MP4_CRF_VALUE=30\nTS2MP4_DELETE_ORIGINALS=0\n")
+
+        assert Config.load_env_file(env_file) is True
+
+        assert Config.CRF_VALUE == 30
+        assert Config.DELETE_ORIGINALS is False
+
+    def test_real_environment_takes_precedence(self, temp_dir, restore_config):
+        env_file = temp_dir / ".env"
+        env_file.write_text("TS2MP4_CRF_VALUE=30\n")
+        os.environ["TS2MP4_CRF_VALUE"] = "18"
+
+        Config.load_env_file(env_file)
+
+        assert Config.CRF_VALUE == 18
+
+    def test_missing_env_file_changes_nothing(self, temp_dir, restore_config):
+        original_crf = Config.CRF_VALUE
+
+        assert Config.load_env_file(temp_dir / ".env") is False
+
+        assert Config.CRF_VALUE == original_crf

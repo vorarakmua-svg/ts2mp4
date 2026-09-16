@@ -2,32 +2,55 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default) not in ("0", "false", "False")
+
 
 class Config:
-    # Paths (override via environment variables)
-    INPUT_DIR = Path(os.getenv("TS2MP4_INPUT_DIR", r"C:\input")).expanduser()
-    OUTPUT_DIR = Path(os.getenv("TS2MP4_OUTPUT_DIR", r"C:\output")).expanduser()
-    LOG_DIR = Path(os.getenv("TS2MP4_LOG_DIR", "logs")).expanduser()
-    
-    # Extensions
-    INPUT_EXT = os.getenv("TS2MP4_INPUT_EXT", ".ts")
-    OUTPUT_EXT = os.getenv("TS2MP4_OUTPUT_EXT", ".mp4")
-    
-    # FFmpeg Settings
-    FFMPEG_BIN = os.getenv("TS2MP4_FFMPEG_BIN", "ffmpeg")
-    FFPROBE_BIN = os.getenv("TS2MP4_FFPROBE_BIN", "ffprobe")
-    
-    # Encoding Settings
-    CRF_VALUE = int(os.getenv("TS2MP4_CRF_VALUE", "21"))
-    PRESET = os.getenv("TS2MP4_NVENC_PRESET", "p4") # p1 (fastest) to p7 (slowest/best quality)
-    GPU_MAX_ATTEMPTS = int(os.getenv("TS2MP4_GPU_MAX_ATTEMPTS", "1"))
-    ENABLE_GPU = os.getenv("TS2MP4_ENABLE_GPU", "1") not in ("0", "false", "False")
-    FORCE_GPU = os.getenv("TS2MP4_FORCE_GPU", "0") in ("1", "true", "True")
-    
-    # Resource Management
-    MAX_CONCURRENT_CONVERSIONS = int(os.getenv("TS2MP4_MAX_CONCURRENT", "1"))
-    SLEEP_BETWEEN_FILES = float(os.getenv("TS2MP4_SLEEP_BETWEEN", "2"))
-    
+    # All settings can be overridden via environment variables (see _read_environment)
+
+    @classmethod
+    def _read_environment(cls):
+        # Paths
+        cls.INPUT_DIR = Path(os.getenv("TS2MP4_INPUT_DIR", r"C:\input")).expanduser()
+        cls.OUTPUT_DIR = Path(os.getenv("TS2MP4_OUTPUT_DIR", r"C:\output")).expanduser()
+        cls.LOG_DIR = Path(os.getenv("TS2MP4_LOG_DIR", "logs")).expanduser()
+
+        # Extensions
+        cls.INPUT_EXT = os.getenv("TS2MP4_INPUT_EXT", ".ts")
+        cls.OUTPUT_EXT = os.getenv("TS2MP4_OUTPUT_EXT", ".mp4")
+
+        # FFmpeg Settings
+        cls.FFMPEG_BIN = os.getenv("TS2MP4_FFMPEG_BIN", "ffmpeg")
+        cls.FFPROBE_BIN = os.getenv("TS2MP4_FFPROBE_BIN", "ffprobe")
+
+        # Encoding Settings
+        cls.CRF_VALUE = int(os.getenv("TS2MP4_CRF_VALUE", "21"))
+        cls.PRESET = os.getenv("TS2MP4_NVENC_PRESET", "p4")  # p1 (fastest) to p7 (slowest/best quality)
+        cls.GPU_MAX_ATTEMPTS = int(os.getenv("TS2MP4_GPU_MAX_ATTEMPTS", "1"))
+        cls.ENABLE_GPU = _env_flag("TS2MP4_ENABLE_GPU", "1")
+        cls.FORCE_GPU = os.getenv("TS2MP4_FORCE_GPU", "0") in ("1", "true", "True")
+
+        # Output Handling
+        cls.DELETE_ORIGINALS = _env_flag("TS2MP4_DELETE_ORIGINALS", "1")
+        cls.OVERWRITE_EXISTING = os.getenv("TS2MP4_OVERWRITE", "0") in ("1", "true", "True")
+
+        # Resource Management
+        cls.MAX_CONCURRENT_CONVERSIONS = int(os.getenv("TS2MP4_MAX_CONCURRENT", "1"))
+        cls.SLEEP_BETWEEN_FILES = float(os.getenv("TS2MP4_SLEEP_BETWEEN", "2"))
+
+    @classmethod
+    def load_env_file(cls, path: Path) -> bool:
+        """Load settings from a .env file. Variables already set in the environment take precedence."""
+        if not Path(path).is_file():
+            return False
+        load_dotenv(path, override=False)
+        cls._read_environment()
+        return True
+
     @classmethod
     def ensure_dirs(cls):
         cls.INPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,6 +66,8 @@ class Config:
         ffmpeg_bin: Optional[str] = None,
         ffprobe_bin: Optional[str] = None,
         sleep_between: Optional[float] = None,
+        delete_originals: Optional[bool] = None,
+        overwrite_existing: Optional[bool] = None,
     ):
         """Allow CLI overrides to adjust runtime configuration."""
         if input_dir:
@@ -57,4 +82,11 @@ class Config:
             cls.FFPROBE_BIN = ffprobe_bin
         if sleep_between is not None:
             cls.SLEEP_BETWEEN_FILES = max(0.0, float(sleep_between))
+        if delete_originals is not None:
+            cls.DELETE_ORIGINALS = delete_originals
+        if overwrite_existing is not None:
+            cls.OVERWRITE_EXISTING = overwrite_existing
         cls.ensure_dirs()
+
+
+Config._read_environment()

@@ -23,6 +23,7 @@ class ConversionResult:
     encoder: str = ""
     retried_with_cpu: bool = False
     cancelled: bool = False
+    skipped: bool = False
     error: Optional[str] = None
 
 
@@ -145,16 +146,6 @@ class VideoConverter:
         """
         Converts a single file and returns a detailed result.
         """
-        # SECURITY VALIDATION BLOCK
-        try:
-            self._validate_path_safety(input_path)
-            self._validate_path_within_directory(input_path, Config.INPUT_DIR)
-            self._validate_file_size(input_path)
-            self._check_disk_space(input_path, Config.OUTPUT_DIR)
-        except (ValueError, FileNotFoundError, OSError) as e:
-            logger.error(f"Security validation failed for {input_path}: {e}")
-            return ConversionResult(False, error=str(e))
-
         if not input_path.exists():
             message = f"Input file does not exist: {input_path}"
             logger.error(message)
@@ -172,10 +163,25 @@ class VideoConverter:
 
         Config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+        # SECURITY VALIDATION BLOCK
+        try:
+            self._validate_path_safety(input_path)
+            self._validate_path_within_directory(input_path, Config.INPUT_DIR)
+            self._validate_file_size(input_path)
+            self._check_disk_space(input_path, Config.OUTPUT_DIR)
+        except (ValueError, FileNotFoundError, OSError) as e:
+            logger.error(f"Security validation failed for {input_path}: {e}")
+            return ConversionResult(False, error=str(e))
+
         output_filename = input_path.stem + Config.OUTPUT_EXT
         output_path = Config.OUTPUT_DIR / output_filename
         temp_output_path = output_path.with_name(output_path.name + ".partial")
         output_format = Config.OUTPUT_EXT.lstrip(".")
+
+        if output_path.exists() and not Config.OVERWRITE_EXISTING:
+            message = f"Output already exists, skipping: {output_path.name}"
+            logger.warning(message)
+            return ConversionResult(False, output_path=output_path, skipped=True, error=message)
 
         audio_opts = ["-c:a", "aac", "-b:a", "192k"]
         input_info = VideoValidator.get_video_info(input_path)
@@ -265,11 +271,12 @@ class VideoConverter:
                     self._safe_unlink(temp_output_path)
                     return ConversionResult(False, source_duration=source_duration, error=last_error)
 
-            try:
-                input_path.unlink()
-                logger.info(f"Deleted original file: {input_path}")
-            except OSError as e:
-                logger.error(f"Failed to delete original file {input_path}: {e}")
+            if Config.DELETE_ORIGINALS:
+                try:
+                    input_path.unlink()
+                    logger.info(f"Deleted original file: {input_path}")
+                except OSError as e:
+                    logger.error(f"Failed to delete original file {input_path}: {e}")
 
             realtime_factor = None
             if elapsed > 0 and source_duration:
