@@ -59,7 +59,7 @@ def demo_conversion():
         # Clear and show completion message
         display.clear_screen()
         print("\n✓ Demo completed successfully!")
-        print("\nThis is what you'll see when running: python main_enhanced.py")
+        print("\nThis is what you'll see when running: python main.py")
 
     except KeyboardInterrupt:
         display.clear_screen()

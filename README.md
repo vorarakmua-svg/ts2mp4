@@ -1,52 +1,70 @@
-# TS2MP4 Enterprise Converter
+# TS2MP4
 
-A robust, enterprise-grade Python application to convert `.ts` files to `.mp4` with NVIDIA GPU acceleration, validation, and resource management.
+Batch-converts `.ts` (MPEG transport stream) files to `.mp4` using FFmpeg, with NVIDIA NVENC acceleration and automatic CPU fallback.
 
-## Features
-- **GPU Acceleration**: Automatically detects and uses NVIDIA GPU (NVENC) if available. Fails over to CPU if needed.
-- **Validation**: Verifies output integrity (duration, stream existence) before deleting the original file.
-- **Resource Management**: Sequential processing and configurable sleep intervals to prevent overheating.
-- **Progress Tracking**: Detailed progress bars for both total batch and individual file progress.
-- **Logging**: Comprehensive logging to `logs/` directory.
+Each output is validated (it must exist, contain a video stream, and match the source duration within 1%) before the original `.ts` file is deleted.
 
-## Setup
-1. Ensure you have Python installed.
-2. Install `ffmpeg` and add it to your system PATH.
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Create `C:\input` and `C:\output` directories (or configure in `config.py`).
-5. Place `.ts` files in `C:\input`.
+## Requirements
+
+- Python 3.8+
+- FFmpeg and FFprobe on your `PATH` (or pass their locations with `--ffmpeg-bin` / `--ffprobe-bin`)
+- Optional: an NVIDIA GPU and an FFmpeg build with `h264_nvenc`
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Usage
-Run the `run.bat` script or execute:
-```bash
-python -m main
-```
-(Note: Run from the parent directory or adjust python path if running directly)
-Better way if you are in the project root:
+
+Put `.ts` files in the input directory (default `C:\input`) and run:
+
 ```bash
 python main.py
 ```
-*Wait, `main.py` imports with relative imports (e.g. `from .config`). It should be run as a module or imports adjusted.*
 
-**Correct Usage:**
-Since the code uses relative imports (e.g., `from .config`), it is designed to be run as a package.
-1. Go to the parent directory of this folder.
-2. Run `python -m ts2mp4.main`
+On Windows you can also double-click `run.bat`. Converted files are written to the output directory (default `C:\output`). Press `Ctrl+C` to stop; the file in progress is cancelled and its partial output removed.
 
-**OR** (Simpler for single folder):
-I have adjusted `main.py` to work if you simply remove the dots in imports if you want to run it as a script inside the folder. 
-*Current implementation uses relative imports, so please run as:*
+### Command-line options
+
+| Option | Description |
+| --- | --- |
+| `--input-dir PATH` | Directory containing input `.ts` files |
+| `--output-dir PATH` | Directory where `.mp4` files are written |
+| `--log-dir PATH` | Directory for logs, metrics, and health reports |
+| `--ffmpeg-bin PATH` | Path to the `ffmpeg` executable |
+| `--ffprobe-bin PATH` | Path to the `ffprobe` executable |
+| `--dry-run` | List what would be converted without changing anything |
+| `--profile` | Write a cProfile performance report to the log directory |
+| `--wizard` | Interactive configuration helper |
+
+### Environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TS2MP4_INPUT_DIR` | `C:\input` | Input directory |
+| `TS2MP4_OUTPUT_DIR` | `C:\output` | Output directory |
+| `TS2MP4_LOG_DIR` | `logs` | Log directory |
+| `TS2MP4_FFMPEG_BIN` | `ffmpeg` | FFmpeg executable |
+| `TS2MP4_FFPROBE_BIN` | `ffprobe` | FFprobe executable |
+| `TS2MP4_ENABLE_GPU` | `1` | Set to `0` to always encode on the CPU |
+| `TS2MP4_FORCE_GPU` | `0` | Set to `1` to skip NVENC detection and use the GPU |
+| `TS2MP4_GPU_MAX_ATTEMPTS` | `1` | GPU attempts before falling back to CPU |
+| `TS2MP4_NVENC_PRESET` | `p4` | NVENC preset, `p1` (fastest) to `p7` (best quality) |
+| `TS2MP4_CRF_VALUE` | `21` | Quality target (lower is better quality, larger files) |
+| `TS2MP4_MAX_CONCURRENT` | `1` | Number of files converted in parallel |
+
+Command-line options take precedence over environment variables.
+
+## Output
+
+The `logs/` directory receives, per run:
+
+- `conversion_*.log` — full run log
+- `metrics_*.json` / `metrics_*.csv` — per-file conversion statistics
+- `health_report_*.json` — CPU, memory, disk, and GPU snapshots
+
+## Development
+
 ```bash
-# From inside the project directory, you might need to adjust imports or run as:
-python -m ts2mp4.main
+python -m pytest
 ```
-*Actually, to make it easiest for you, I will ensure `main.py` works when run directly inside the folder by fixing imports if needed, or just providing a launcher.*
-
-## Configuration
-Edit `config.py` to change:
-- Input/Output directories
-- Encoding quality (CRF)
-- Sleep intervals
