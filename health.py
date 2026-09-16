@@ -252,14 +252,14 @@ class HealthMonitor:
         Export detailed health report
 
         Args:
-            output_path: Custom output path (default: logs/health_report_TIMESTAMP.json)
+            output_path: Custom output path (default: health_report_TIMESTAMP.json next to the status file)
 
         Returns:
             Path to exported report
         """
         if not output_path:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = Path("logs") / f"health_report_{timestamp}.json"
+            output_path = self.status_file.parent / f"health_report_{timestamp}.json"
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
